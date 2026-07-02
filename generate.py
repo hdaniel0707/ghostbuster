@@ -1,3 +1,9 @@
+from dotenv import load_dotenv
+
+# Load .env before building the OpenAI/Anthropic clients below so OPENAI_API_KEY /
+# ANTHROPIC_API_KEY are already in the environment.
+load_dotenv()
+
 import argparse
 import openai
 import re
@@ -9,6 +15,14 @@ import numpy as np
 import string
 import torch
 
+# python generate.py --debug --limit 3           # mock LLM calls, first 3 items
+# python generate.py --limit 3 --wp_gpt           # real API calls, first 3 items only
+
+try:
+    import anthropic as _anthropic
+except ImportError:
+    _anthropic = None
+
 from nltk.corpus import wordnet
 from datasets import load_dataset
 from nltk.tokenize.treebank import TreebankWordDetokenizer
@@ -18,7 +32,7 @@ from tenacity import (
     wait_random_exponential,
 )
 from transformers import PegasusForConditionalGeneration, PegasusTokenizer
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 
 from utils.generate import generate_documents
 from utils.write_logprobs import write_logprobs, write_llama_logprobs
@@ -30,7 +44,6 @@ nltk.download("wordnet")
 nltk.download("omw-1.4")
 
 
-llama_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
@@ -45,6 +58,10 @@ datasets = [
 generate_dataset_fn = get_generate_dataset(*datasets)
 
 prompt_types = ["gpt", "gpt_prompt1", "gpt_prompt2", "gpt_writing", "gpt_semantic"]
+# Claude only generates the default (unstyled) prompt, not the gpt_prompt1/gpt_prompt2/
+# gpt_writing/gpt_semantic variants. zip(prompt_types_claude, prompts) below then only
+# pairs with prompts[0], the plain prompt each get_*_prompts() returns first.
+prompt_types_claude = ["claude"]
 html_replacements = [
     ("&amp;", "&"),
     ("&lt;", "<"),
@@ -89,9 +106,38 @@ def html_replace(text):
     return text
 
 
+_openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
 def openai_backoff(**kwargs):
-    return openai.ChatCompletion.create(**kwargs)
+    return _openai_client.chat.completions.create(**kwargs)
+
+
+@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
+def claude_backoff(**kwargs):
+    if _anthropic is None:
+        raise ImportError("anthropic package not installed; run: pip install anthropic")
+    client = _anthropic.Anthropic()
+    return client.messages.create(**kwargs)
+
+
+def call_llm(messages, gpt_model=None, claude_model=None, debug=False):
+    """Call either OpenAI or Anthropic based on which model arg is set."""
+    if debug:
+        print(f"  [DEBUG] Skipping API call. Prompt: {messages[-1]['content'][:80]!r}...")
+        return "[DEBUG] This is a mock LLM response used for testing."
+    if claude_model:
+        response = claude_backoff(
+            model=claude_model,
+            max_tokens=2048,
+            messages=messages,
+        )
+        return response.content[0].text.strip()
+    else:
+        model = gpt_model or "gpt-3.5-turbo"
+        response = openai_backoff(model=model, messages=messages)
+        return response.choices[0].message.content.strip()
 
 
 def round_to_100(n):
@@ -166,17 +212,29 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--gpt_model", type=str, default="gpt-5.4-mini",
+                        help="OpenAI model to use for generation")
+    parser.add_argument("--claude_model", type=str, default="claude-sonnet-5",
+                        help="Anthropic Claude model to use instead of OpenAI")
+    parser.add_argument("--debug", action="store_true",
+                        help="Debug mode: mock all LLM calls instead of making real API calls")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Cap every loop to the first N items. Works with or without --debug, "
+                             "so it can be used to test real API calls on a small sample.")
 
     parser.add_argument("--wp_prompts", action="store_true")
     parser.add_argument("--wp_human", action="store_true")
     parser.add_argument("--wp_gpt", action="store_true")
+    parser.add_argument("--wp_claude", action="store_true")
 
     parser.add_argument("--reuter_human", action="store_true")
     parser.add_argument("--reuter_gpt", action="store_true")
+    parser.add_argument("--reuter_claude", action="store_true")
 
     parser.add_argument("--essay_prompts", action="store_true")
     parser.add_argument("--essay_human", action="store_true")
     parser.add_argument("--essay_gpt", action="store_true")
+    parser.add_argument("--essay_claude", action="store_true")
 
     parser.add_argument("--logprobs", action="store_true")
     parser.add_argument("--logprob_other", action="store_true")
@@ -190,6 +248,12 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if args.debug:
+        print("[DEBUG MODE] Mocking all LLM calls.")
+    if args.limit is not None:
+        print(f"Capping loops to the first {args.limit} items.")
+    limit = args.limit  # None means use the original full size
+
     if args.wp_prompts:
 
         def format_prompt(p):
@@ -199,28 +263,25 @@ if __name__ == "__main__":
             p = re.sub(r"\s+", " ", p)
             return p.strip()
 
+        wp_limit = limit or 1000
         with open("data/wp/raw/train.wp_source", "r") as f:
             num_lines_read = 0
 
             print("Generating and writing WP prompts...")
 
-            pbar = tqdm.tqdm(total=1000)
+            pbar = tqdm.tqdm(total=wp_limit)
             for prompt in f:
-                if num_lines_read >= 1000:
+                if num_lines_read >= wp_limit:
                     break
 
                 input_prompt = format_prompt(prompt)
 
-                response = openai_backoff(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": f"Remove all the formatting in this prompt:\n\n{input_prompt}",
-                        }
-                    ],
+                reply = call_llm(
+                    messages=[{"role": "user", "content": f"Remove all the formatting in this prompt:\n\n{input_prompt}"}],
+                    gpt_model=args.gpt_model,
+                    claude_model=args.claude_model,
+                    debug=args.debug,
                 )
-                reply = response["choices"][0]["message"]["content"].strip()
 
                 with open(f"data/wp/prompts/{num_lines_read + 1}.txt", "w") as f:
                     f.write(reply)
@@ -233,12 +294,13 @@ if __name__ == "__main__":
     if args.wp_human:
         print("Formatting Human WP documents...")
 
+        wp_limit = limit or 1000
         with open("data/wp/raw/train.wp_target", "r") as f:
             num_lines_read = 0
 
-            pbar = tqdm.tqdm(total=1000)
+            pbar = tqdm.tqdm(total=wp_limit)
             for doc in f:
-                if num_lines_read >= 1000:
+                if num_lines_read >= wp_limit:
                     break
 
                 doc = doc.strip()
@@ -275,42 +337,49 @@ if __name__ == "__main__":
 
             pbar.close()
 
-    if args.wp_gpt:
-        print("Generating GPT WP documents...")
+    if args.wp_gpt or args.wp_claude:
+        wp_variants = []
+        if args.wp_gpt:
+            wp_variants.append((prompt_types, args.gpt_model, None))
+        if args.wp_claude:
+            wp_variants.append((prompt_types_claude, None, args.claude_model))
 
-        for idx in tqdm.tqdm(range(1, 1001)):
+        print("Generating WP documents for:", ", ".join(t for types, _, _ in wp_variants for t in types))
+
+        for types, _, _ in wp_variants:
+            for type in types:
+                if not os.path.exists(f"data/wp/{type}"):
+                    os.makedirs(f"data/wp/{type}")
+
+        for idx in tqdm.tqdm(range(1, (limit or 1000) + 1)):
             with open(f"data/wp/prompts/{idx}.txt", "r") as f:
                 prompt = f.read().strip()
 
             with open(f"data/wp/human/{idx}.txt", "r") as f:
                 words = round_to_100(len(f.read().split(" ")))
 
-            prompts = get_wp_prompts(words, prompt)
+            for types, gpt_model, claude_model in wp_variants:
+                prompts = get_wp_prompts(words, prompt)
 
-            for type, prompt in zip(prompt_types, prompts):
-                if os.path.exists(f"data/wp/{type}/{idx}.txt"):
-                    continue
+                for type, variant_prompt in zip(types, prompts):
+                    if os.path.exists(f"data/wp/{type}/{idx}.txt"):
+                        continue
 
-                response = openai_backoff(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        }
-                    ],
-                )
+                    reply = call_llm(
+                        messages=[{"role": "user", "content": variant_prompt}],
+                        gpt_model=gpt_model,
+                        claude_model=claude_model,
+                        debug=args.debug,
+                    )
+                    reply = reply.replace("\n\n", "\n")
 
-                reply = response["choices"][0]["message"]["content"].strip()
-                reply = reply.replace("\n\n", "\n")
-
-                with open(f"data/wp/{type}/{idx}.txt", "w") as f:
-                    f.write(reply)
+                    with open(f"data/wp/{type}/{idx}.txt", "w") as f:
+                        f.write(reply)
 
     if args.reuter_human:
         reuter_replace = ["--", "202-898-8312", "((", "($1=", "(A$", "Reuters Chicago"]
 
-        authors = os.listdir("data/reuter/raw/C50train")
+        authors = os.listdir("data/reuter/raw/C50train")[:limit]
         print("Formatting Human Reuters documents...")
 
         for author in tqdm.tqdm(authors):
@@ -325,7 +394,7 @@ if __name__ == "__main__":
                 for i in os.listdir(f"data/reuter/raw/C50test/{author}")
             ]
 
-            for n, file in enumerate(files[:20]):
+            for n, file in enumerate(files[:limit or 20]):
                 with open(file, "r") as f:
                     doc = f.read().strip()
                     doc = doc.replace("\n\n", "\n")
@@ -339,50 +408,52 @@ if __name__ == "__main__":
                     with open(f"data/reuter/human/{author}/{n+1}.txt", "w") as f:
                         f.write(doc.strip())
 
-    if args.reuter_gpt:
-        print("Generating GPT Reuters documents...")
+    if args.reuter_gpt or args.reuter_claude:
+        reuter_variants = []
+        if args.reuter_gpt:
+            reuter_variants.append((prompt_types, args.gpt_model, None))
+        if args.reuter_claude:
+            reuter_variants.append((prompt_types_claude, None, args.claude_model))
 
-        authors = os.listdir("data/reuter/human")
+        print("Generating Reuters documents for:", ", ".join(t for types, _, _ in reuter_variants for t in types))
+
+        authors = os.listdir("data/reuter/human")[:limit]
         for author in tqdm.tqdm(authors):
-            for idx in range(1, 21):
+            for idx in range(1, (limit or 20) + 1):
                 with open(f"data/reuter/human/{author}/{idx}.txt", "r") as f:
                     words = round_to_100(len(f.read().split(" ")))
 
                 with open(f"data/reuter/gpt/{author}/headlines/{idx}.txt", "r") as f:
                     headline = f.read().strip()
 
-                prompts = get_reuter_prompts(words, headline)
+                for types, gpt_model, claude_model in reuter_variants:
+                    prompts = get_reuter_prompts(words, headline)
 
-                for type, prompt in zip(prompt_types, prompts):
-                    if not os.path.exists(f"data/reuter/{type}/{author}"):
-                        os.makedirs(f"data/reuter/{type}/{author}")
+                    for type, variant_prompt in zip(types, prompts):
+                        if not os.path.exists(f"data/reuter/{type}/{author}"):
+                            os.makedirs(f"data/reuter/{type}/{author}")
 
-                    if os.path.exists(f"data/reuter/{type}/{author}/{idx}.txt"):
-                        continue
+                        if os.path.exists(f"data/reuter/{type}/{author}/{idx}.txt"):
+                            continue
 
-                    response = openai_backoff(
-                        model="gpt-3.5-turbo",
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": prompt,
-                            }
-                        ],
-                    )
+                        reply = call_llm(
+                            messages=[{"role": "user", "content": variant_prompt}],
+                            gpt_model=gpt_model,
+                            claude_model=claude_model,
+                            debug=args.debug,
+                        )
+                        reply = reply.replace("\n\n", "\n")
 
-                    reply = response["choices"][0]["message"]["content"].strip()
-                    reply = reply.replace("\n\n", "\n")
+                        lines = reply.split("\n")
+                        if any([i in lines[0].lower() for i in ["sure", "certainly"]]):
+                            reply = "\n".join(lines[1:])
 
-                    lines = reply.split("\n")
-                    if any([i in lines[0].lower() for i in ["sure", "certainly"]]):
-                        reply = "\n".join(lines[1:])
+                        lines = reply.split("\n")
+                        if any([i in lines[0].lower() for i in ["title"]]):
+                            reply = "\n".join(lines[1:])
 
-                    lines = reply.split("\n")
-                    if any([i in lines[0].lower() for i in ["title"]]):
-                        reply = "\n".join(lines[1:])
-
-                    with open(f"data/reuter/{type}/{author}/{idx}.txt", "w") as f:
-                        f.write(reply)
+                        with open(f"data/reuter/{type}/{author}/{idx}.txt", "w") as f:
+                            f.write(reply)
 
     if args.essay_human or args.essay_gpt:
         essay_dataset = load_dataset("qwedsacf/ivypanda-essays")
@@ -390,10 +461,11 @@ if __name__ == "__main__":
     if args.essay_human:
         print("Formatting Human Essay documents...")
 
+        essay_limit = limit or 1000
         num_documents, idx = 0, 0
-        pbar = tqdm.tqdm(total=1000)
+        pbar = tqdm.tqdm(total=essay_limit)
 
-        while num_documents < 1000:
+        while num_documents < essay_limit:
             essay = essay_dataset["train"][idx]
             essay = essay["TEXT"].strip()
             essay = essay[essay.index("\n") + 1 :]
@@ -433,68 +505,67 @@ if __name__ == "__main__":
     if args.essay_prompts:
         print("Generating Essay prompts...")
 
-        for idx in tqdm.tqdm(range(1, 1001)):
+        for idx in tqdm.tqdm(range(1, (limit or 1000) + 1)):
             with open(f"data/essay/human/{idx}.txt", "r") as f:
                 doc = f.read().strip()
 
-            response = openai_backoff(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"Given the following essay, write a prompt for it:\n\n{' '.join(doc.split(' ')[:500])}",
-                    }
-                ],
+            reply = call_llm(
+                messages=[{"role": "user", "content": f"Given the following essay, write a prompt for it:\n\n{' '.join(doc.split(' ')[:500])}"}],
+                gpt_model=args.gpt_model,
+                claude_model=args.claude_model,
+                debug=args.debug,
             )
-            reply = response["choices"][0]["message"]["content"].strip()
             reply = reply.replace("Prompt: ", "").strip()
 
             with open(f"data/essay/prompts/{idx}.txt", "w") as f:
                 f.write(reply)
 
-    if args.essay_gpt:
-        print("Generating GPT Essay documents...")
+    if args.essay_gpt or args.essay_claude:
+        essay_variants = []
+        if args.essay_gpt:
+            essay_variants.append((prompt_types, args.gpt_model, None))
+        if args.essay_claude:
+            essay_variants.append((prompt_types_claude, None, args.claude_model))
 
-        for type in prompt_types:
-            if not os.path.exists(f"data/essay/{type}"):
-                os.makedirs(f"data/essay/{type}")
+        print("Generating Essay documents for:", ", ".join(t for types, _, _ in essay_variants for t in types))
 
-        for idx in tqdm.tqdm(range(1, 1001)):
+        for types, _, _ in essay_variants:
+            for type in types:
+                if not os.path.exists(f"data/essay/{type}"):
+                    os.makedirs(f"data/essay/{type}")
+
+        for idx in tqdm.tqdm(range(1, (limit or 1000) + 1)):
             with open(f"data/essay/prompts/{idx}.txt", "r") as f:
                 prompt = f.read().strip()
 
             with open(f"data/essay/human/{idx}.txt", "r") as f:
                 words = round_to_100(len(f.read().split(" ")))
 
-            prompts = get_essay_prompts(words, prompt)
+            for types, gpt_model, claude_model in essay_variants:
+                prompts = get_essay_prompts(words, prompt)
 
-            for type, prompt in zip(prompt_types, prompts):
-                if os.path.exists(f"data/essay/{type}/{idx}.txt"):
-                    continue
+                for type, variant_prompt in zip(types, prompts):
+                    if os.path.exists(f"data/essay/{type}/{idx}.txt"):
+                        continue
 
-                response = openai_backoff(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        }
-                    ],
-                )
+                    reply = call_llm(
+                        messages=[{"role": "user", "content": variant_prompt}],
+                        gpt_model=gpt_model,
+                        claude_model=claude_model,
+                        debug=args.debug,
+                    )
+                    reply = reply.replace("\n\n", "\n")
 
-                reply = response["choices"][0]["message"]["content"].strip()
-                reply = reply.replace("\n\n", "\n")
+                    lines = reply.split("\n")
+                    if any([i in lines[0].lower() for i in ["sure", "certainly"]]):
+                        reply = "\n".join(lines[1:])
 
-                lines = reply.split("\n")
-                if any([i in lines[0].lower() for i in ["sure", "certainly"]]):
-                    reply = "\n".join(lines[1:])
+                    lines = reply.split("\n")
+                    if any([i in lines[0].lower() for i in ["title"]]):
+                        reply = "\n".join(lines[1:])
 
-                lines = reply.split("\n")
-                if any([i in lines[0].lower() for i in ["title"]]):
-                    reply = "\n".join(lines[1:])
-
-                with open(f"data/essay/{type}/{idx}.txt", "w") as f:
-                    f.write(reply)
+                    with open(f"data/essay/{type}/{idx}.txt", "w") as f:
+                        f.write(reply)
 
     if args.logprobs:
         datasets = [

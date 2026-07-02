@@ -3,6 +3,8 @@ scikit-learn
 numpy
 tenacity
 openai==0.28.1
+anthropic
+python-dotenv
 torch
 tiktoken
 flask
