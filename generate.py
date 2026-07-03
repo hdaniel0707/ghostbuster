@@ -14,6 +14,7 @@ import nltk
 import numpy as np
 import string
 import torch
+from datetime import datetime
 
 # python generate.py --debug --limit 3           # mock LLM calls, first 3 items
 # uv run python generate.py --limit 10 --wp_gpt           # real API calls, first 3 items only
@@ -57,7 +58,6 @@ datasets = [
 ]
 generate_dataset_fn = get_generate_dataset(*datasets)
 
-prompt_types = ["gpt", "gpt_prompt1", "gpt_prompt2", "gpt_writing", "gpt_semantic"]
 # Maps each gpt_* prompt type to its index in the list returned by get_*_prompts().
 PROMPT_TYPE_INDICES = {
     "gpt": 0,
@@ -65,6 +65,7 @@ PROMPT_TYPE_INDICES = {
     "gpt_prompt2": 2,
     "gpt_writing": 3,
     "gpt_semantic": 4,
+    "gpt_plain": 6,
 }
 # Claude only generates the default (unstyled) prompt, not the gpt_prompt1/gpt_prompt2/
 # gpt_writing/gpt_semantic variants, so it always uses prompts[0], the plain prompt each
@@ -139,22 +140,77 @@ def claude_backoff(**kwargs):
     return client.messages.create(**kwargs)
 
 
-def call_llm(messages, gpt_model=None, claude_model=None, debug=False):
-    """Call either OpenAI or Anthropic based on which model arg is set."""
+def call_llm(messages, mode, model, debug=False):
+    """Call OpenAI or Anthropic depending on `mode` ("gpt" or "claude")."""
     if debug:
         print(f"  [DEBUG] Skipping API call. Prompt: {messages[-1]['content'][:80]!r}...")
         return "[DEBUG] This is a mock LLM response used for testing."
-    if claude_model:
+    if mode == "gpt":
+        response = openai_backoff(model=model, messages=messages)
+        return response.choices[0].message.content.strip()
+    elif mode == "claude":
         response = claude_backoff(
-            model=claude_model,
+            model=model,
             max_tokens=2048,
             messages=messages,
         )
         return response.content[0].text.strip()
     else:
-        model = gpt_model or "gpt-3.5-turbo"
-        response = openai_backoff(model=model, messages=messages)
-        return response.choices[0].message.content.strip()
+        raise ValueError(f"Unknown mode {mode!r}; expected 'gpt' or 'claude'")
+
+
+def record_result(stats, path, error=None):
+    """Track a generated file's outcome for the end-of-run summary."""
+    if error is None:
+        stats["created"].append(path)
+    else:
+        stats["missed"].append((path, str(error)))
+
+
+def group_counts_by_dir(paths):
+    counts = {}
+    for path in paths:
+        folder = os.path.dirname(path)
+        counts[folder] = counts.get(folder, 0) + 1
+    return counts
+
+
+def print_and_log_summary(stats, log_path="generate.log"):
+    if not stats["created"] and not stats["missed"]:
+        return
+
+    lines = [
+        "",
+        "=== Generation Summary ===",
+        f"Created: {len(stats['created'])}",
+        f"Missed:  {len(stats['missed'])}",
+    ]
+
+    if stats["created"]:
+        lines.append("")
+        lines.append("Created by folder:")
+        for folder, count in sorted(group_counts_by_dir(stats["created"]).items()):
+            lines.append(f"  {folder}: {count}")
+
+    if stats["missed"]:
+        lines.append("")
+        lines.append("Missed by folder:")
+        missed_paths = [path for path, _ in stats["missed"]]
+        for folder, count in sorted(group_counts_by_dir(missed_paths).items()):
+            lines.append(f"  {folder}: {count}")
+
+        lines.append("")
+        lines.append("Missed files:")
+        for path, error in stats["missed"]:
+            lines.append(f"  {path}: {error}")
+
+    summary = "\n".join(lines)
+    print(summary)
+
+    with open(log_path, "a") as f:
+        f.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] generate.py run\n")
+        f.write(summary)
+        f.write("\n")
 
 
 def round_to_100(n):
@@ -169,6 +225,7 @@ def get_wp_prompts(words, prompt):
         f'Please help me write a short story in response to the prompt "{prompt}."',
         f'Write a {words}-word story in the style of a beginner writer in response to the prompt "{prompt}."',
         f'Write a story with very short sentences in {words} words to the prompt "{prompt}."',
+        f'Write a story in {words} words to the prompt "{prompt}." Do not use any markdown formatting (no asterisks, headers, or bullet points) — write in plain prose only, as a human would.',
     ]
 
 
@@ -180,6 +237,7 @@ def get_reuter_prompts(words, headline):
         f'Please help me write a New York Times article for the headline "{headline}."',
         f'Write a {words}-word news article in the style of a New York Times article based on the headline "{headline}."',
         f'Write a news article with very short sentences in {words} words based on the headline "{headline}."',
+        f'Write a news article in {words} words based on the headline "{headline}." Do not use any markdown formatting (no asterisks, headers, or bullet points) — write in plain prose only, as a human would.',
     ]
 
 
@@ -191,6 +249,7 @@ def get_essay_prompts(words, prompts):
         f'Please help me write an essay in response to the prompt "{prompt}."',
         f"Write a {words}-word essay in the style of a high-school student  in response to the following prompt: {prompt}.",
         f'Write an essay with very short sentences in {words} words to the prompt "{prompt}."',
+        f'Write an essay in {words} words to the prompt "{prompt}." Do not use any markdown formatting (no asterisks, headers, or bullet points) — write in plain prose only, as a human would.',
     ]
 
 
@@ -246,14 +305,17 @@ if __name__ == "__main__":
     parser.add_argument("--wp_gpt_prompt2", action="store_true", help="Generate the WP gpt_prompt2 variant")
     parser.add_argument("--wp_gpt_writing", action="store_true", help="Generate the WP gpt_writing variant")
     parser.add_argument("--wp_gpt_semantic", action="store_true", help="Generate the WP gpt_semantic variant")
+    parser.add_argument("--wp_gpt_plain", action="store_true", help="Generate the WP gpt_plain variant (no markdown formatting, for AI-detector datasets)")
     parser.add_argument("--wp_claude", action="store_true")
 
     parser.add_argument("--reuter_human", action="store_true")
+    parser.add_argument("--reuter_prompts", action="store_true", help="Generate Reuters headlines from human articles, used as prompts")
     parser.add_argument("--reuter_gpt", action="store_true", help="Generate the main (unstyled) Reuters GPT prompt")
     parser.add_argument("--reuter_gpt_prompt1", action="store_true", help="Generate the Reuters gpt_prompt1 variant")
     parser.add_argument("--reuter_gpt_prompt2", action="store_true", help="Generate the Reuters gpt_prompt2 variant")
     parser.add_argument("--reuter_gpt_writing", action="store_true", help="Generate the Reuters gpt_writing variant")
     parser.add_argument("--reuter_gpt_semantic", action="store_true", help="Generate the Reuters gpt_semantic variant")
+    parser.add_argument("--reuter_gpt_plain", action="store_true", help="Generate the Reuters gpt_plain variant (no markdown formatting, for AI-detector datasets)")
     parser.add_argument("--reuter_claude", action="store_true")
 
     parser.add_argument("--essay_prompts", action="store_true")
@@ -263,6 +325,7 @@ if __name__ == "__main__":
     parser.add_argument("--essay_gpt_prompt2", action="store_true", help="Generate the essay gpt_prompt2 variant")
     parser.add_argument("--essay_gpt_writing", action="store_true", help="Generate the essay gpt_writing variant")
     parser.add_argument("--essay_gpt_semantic", action="store_true", help="Generate the essay gpt_semantic variant")
+    parser.add_argument("--essay_gpt_plain", action="store_true", help="Generate the essay gpt_plain variant (no markdown formatting, for AI-detector datasets)")
     parser.add_argument("--essay_claude", action="store_true")
 
     parser.add_argument("--logprobs", action="store_true")
@@ -282,6 +345,8 @@ if __name__ == "__main__":
     if args.limit is not None:
         print(f"Capping loops to the first {args.limit} items.")
     limit = args.limit  # None means use the original full size
+
+    stats = {"created": [], "missed": []}
 
     if args.wp_prompts:
 
@@ -304,16 +369,21 @@ if __name__ == "__main__":
                     break
 
                 input_prompt = format_prompt(prompt)
+                out_path = f"data/wp/prompts/{num_lines_read + 1}.txt"
 
-                reply = call_llm(
-                    messages=[{"role": "user", "content": f"Remove all the formatting in this prompt:\n\n{input_prompt}"}],
-                    gpt_model=args.gpt_model,
-                    claude_model=args.claude_model,
-                    debug=args.debug,
-                )
+                try:
+                    reply = call_llm(
+                        messages=[{"role": "user", "content": f"Remove all the formatting in this prompt:\n\n{input_prompt}"}],
+                        mode="gpt",
+                        model=args.gpt_model,
+                        debug=args.debug,
+                    )
 
-                with open(f"data/wp/prompts/{num_lines_read + 1}.txt", "w") as f:
-                    f.write(reply)
+                    with open(out_path, "w") as out_f:
+                        out_f.write(reply)
+                    record_result(stats, out_path)
+                except Exception as e:
+                    record_result(stats, out_path, error=e)
 
                 num_lines_read += 1
                 pbar.update(1)
@@ -370,9 +440,9 @@ if __name__ == "__main__":
     if wp_gpt_types or args.wp_claude:
         wp_variants = []
         if wp_gpt_types:
-            wp_variants.append((wp_gpt_types, args.gpt_model, None))
+            wp_variants.append((wp_gpt_types, "gpt", args.gpt_model))
         if args.wp_claude:
-            wp_variants.append((prompt_types_claude, None, args.claude_model))
+            wp_variants.append((prompt_types_claude, "claude", args.claude_model))
 
         print("Generating WP documents for:", ", ".join(t for types, _, _ in wp_variants for t in types))
 
@@ -388,25 +458,30 @@ if __name__ == "__main__":
             with open(f"data/wp/human/{idx}.txt", "r") as f:
                 words = round_to_100(len(f.read().split(" ")))
 
-            for types, gpt_model, claude_model in wp_variants:
+            for types, mode, model in wp_variants:
                 prompts = get_wp_prompts(words, prompt)
 
                 for type in types:
-                    if os.path.exists(f"data/wp/{type}/{idx}.txt"):
+                    out_path = f"data/wp/{type}/{idx}.txt"
+                    if os.path.exists(out_path):
                         continue
 
                     variant_prompt = prompts[prompt_index_for_type(type)]
 
-                    reply = call_llm(
-                        messages=[{"role": "user", "content": variant_prompt}],
-                        gpt_model=gpt_model,
-                        claude_model=claude_model,
-                        debug=args.debug,
-                    )
-                    reply = reply.replace("\n\n", "\n")
+                    try:
+                        reply = call_llm(
+                            messages=[{"role": "user", "content": variant_prompt}],
+                            mode=mode,
+                            model=model,
+                            debug=args.debug,
+                        )
+                        reply = reply.replace("\n\n", "\n")
 
-                    with open(f"data/wp/{type}/{idx}.txt", "w") as f:
-                        f.write(reply)
+                        with open(out_path, "w") as f:
+                            f.write(reply)
+                        record_result(stats, out_path)
+                    except Exception as e:
+                        record_result(stats, out_path, error=e)
 
     if args.reuter_human:
         reuter_replace = ["--", "202-898-8312", "((", "($1=", "(A$", "Reuters Chicago"]
@@ -440,13 +515,45 @@ if __name__ == "__main__":
                     with open(f"data/reuter/human/{author}/{n+1}.txt", "w") as f:
                         f.write(doc.strip())
 
+    if args.reuter_prompts:
+        print("Generating Reuters headlines...")
+
+        authors = os.listdir("data/reuter/human")[:limit]
+        for author in tqdm.tqdm(authors):
+            if not os.path.exists(f"data/reuter/gpt/{author}/headlines"):
+                os.makedirs(f"data/reuter/gpt/{author}/headlines")
+
+            for idx in range(1, (limit or 20) + 1):
+                out_path = f"data/reuter/gpt/{author}/headlines/{idx}.txt"
+                if os.path.exists(out_path):
+                    continue
+
+                with open(f"data/reuter/human/{author}/{idx}.txt", "r") as f:
+                    doc = f.read().strip()
+
+                try:
+                    reply = call_llm(
+                        messages=[{"role": "user", "content": f"Given the following news article, write a headline for it. Respond with just the plain headline text, no markdown formatting or asterisks:\n\n{' '.join(doc.split(' ')[:500])}"}],
+                        mode="gpt",
+                        model=args.gpt_model,
+                        debug=args.debug,
+                    )
+                    reply = reply.replace("Headline: ", "").strip()
+                    reply = reply.strip("*").strip()
+
+                    with open(out_path, "w") as f:
+                        f.write(reply)
+                    record_result(stats, out_path)
+                except Exception as e:
+                    record_result(stats, out_path, error=e)
+
     reuter_gpt_types = selected_gpt_types(args, "reuter")
     if reuter_gpt_types or args.reuter_claude:
         reuter_variants = []
         if reuter_gpt_types:
-            reuter_variants.append((reuter_gpt_types, args.gpt_model, None))
+            reuter_variants.append((reuter_gpt_types, "gpt", args.gpt_model))
         if args.reuter_claude:
-            reuter_variants.append((prompt_types_claude, None, args.claude_model))
+            reuter_variants.append((prompt_types_claude, "claude", args.claude_model))
 
         print("Generating Reuters documents for:", ", ".join(t for types, _, _ in reuter_variants for t in types))
 
@@ -459,36 +566,41 @@ if __name__ == "__main__":
                 with open(f"data/reuter/gpt/{author}/headlines/{idx}.txt", "r") as f:
                     headline = f.read().strip()
 
-                for types, gpt_model, claude_model in reuter_variants:
+                for types, mode, model in reuter_variants:
                     prompts = get_reuter_prompts(words, headline)
 
                     for type in types:
                         if not os.path.exists(f"data/reuter/{type}/{author}"):
                             os.makedirs(f"data/reuter/{type}/{author}")
 
-                        if os.path.exists(f"data/reuter/{type}/{author}/{idx}.txt"):
+                        out_path = f"data/reuter/{type}/{author}/{idx}.txt"
+                        if os.path.exists(out_path):
                             continue
 
                         variant_prompt = prompts[prompt_index_for_type(type)]
 
-                        reply = call_llm(
-                            messages=[{"role": "user", "content": variant_prompt}],
-                            gpt_model=gpt_model,
-                            claude_model=claude_model,
-                            debug=args.debug,
-                        )
-                        reply = reply.replace("\n\n", "\n")
+                        try:
+                            reply = call_llm(
+                                messages=[{"role": "user", "content": variant_prompt}],
+                                mode=mode,
+                                model=model,
+                                debug=args.debug,
+                            )
+                            reply = reply.replace("\n\n", "\n")
 
-                        lines = reply.split("\n")
-                        if any([i in lines[0].lower() for i in ["sure", "certainly"]]):
-                            reply = "\n".join(lines[1:])
+                            lines = reply.split("\n")
+                            if any([i in lines[0].lower() for i in ["sure", "certainly"]]):
+                                reply = "\n".join(lines[1:])
 
-                        lines = reply.split("\n")
-                        if any([i in lines[0].lower() for i in ["title"]]):
-                            reply = "\n".join(lines[1:])
+                            lines = reply.split("\n")
+                            if any([i in lines[0].lower() for i in ["title"]]):
+                                reply = "\n".join(lines[1:])
 
-                        with open(f"data/reuter/{type}/{author}/{idx}.txt", "w") as f:
-                            f.write(reply)
+                            with open(out_path, "w") as f:
+                                f.write(reply)
+                            record_result(stats, out_path)
+                        except Exception as e:
+                            record_result(stats, out_path, error=e)
 
     if args.essay_human or args.essay_gpt:
         essay_dataset = load_dataset("qwedsacf/ivypanda-essays")
@@ -541,27 +653,33 @@ if __name__ == "__main__":
         print("Generating Essay prompts...")
 
         for idx in tqdm.tqdm(range(1, (limit or 1000) + 1)):
+            out_path = f"data/essay/prompts/{idx}.txt"
+
             with open(f"data/essay/human/{idx}.txt", "r") as f:
                 doc = f.read().strip()
 
-            reply = call_llm(
-                messages=[{"role": "user", "content": f"Given the following essay, write a prompt for it:\n\n{' '.join(doc.split(' ')[:500])}"}],
-                gpt_model=args.gpt_model,
-                claude_model=args.claude_model,
-                debug=args.debug,
-            )
-            reply = reply.replace("Prompt: ", "").strip()
+            try:
+                reply = call_llm(
+                    messages=[{"role": "user", "content": f"Given the following essay, write a prompt for it:\n\n{' '.join(doc.split(' ')[:500])}"}],
+                    mode="gpt",
+                    model=args.gpt_model,
+                    debug=args.debug,
+                )
+                reply = reply.replace("Prompt: ", "").strip()
 
-            with open(f"data/essay/prompts/{idx}.txt", "w") as f:
-                f.write(reply)
+                with open(out_path, "w") as f:
+                    f.write(reply)
+                record_result(stats, out_path)
+            except Exception as e:
+                record_result(stats, out_path, error=e)
 
     essay_gpt_types = selected_gpt_types(args, "essay")
     if essay_gpt_types or args.essay_claude:
         essay_variants = []
         if essay_gpt_types:
-            essay_variants.append((essay_gpt_types, args.gpt_model, None))
+            essay_variants.append((essay_gpt_types, "gpt", args.gpt_model))
         if args.essay_claude:
-            essay_variants.append((prompt_types_claude, None, args.claude_model))
+            essay_variants.append((prompt_types_claude, "claude", args.claude_model))
 
         print("Generating Essay documents for:", ", ".join(t for types, _, _ in essay_variants for t in types))
 
@@ -577,33 +695,38 @@ if __name__ == "__main__":
             with open(f"data/essay/human/{idx}.txt", "r") as f:
                 words = round_to_100(len(f.read().split(" ")))
 
-            for types, gpt_model, claude_model in essay_variants:
+            for types, mode, model in essay_variants:
                 prompts = get_essay_prompts(words, prompt)
 
                 for type in types:
-                    if os.path.exists(f"data/essay/{type}/{idx}.txt"):
+                    out_path = f"data/essay/{type}/{idx}.txt"
+                    if os.path.exists(out_path):
                         continue
 
                     variant_prompt = prompts[prompt_index_for_type(type)]
 
-                    reply = call_llm(
-                        messages=[{"role": "user", "content": variant_prompt}],
-                        gpt_model=gpt_model,
-                        claude_model=claude_model,
-                        debug=args.debug,
-                    )
-                    reply = reply.replace("\n\n", "\n")
+                    try:
+                        reply = call_llm(
+                            messages=[{"role": "user", "content": variant_prompt}],
+                            mode=mode,
+                            model=model,
+                            debug=args.debug,
+                        )
+                        reply = reply.replace("\n\n", "\n")
 
-                    lines = reply.split("\n")
-                    if any([i in lines[0].lower() for i in ["sure", "certainly"]]):
-                        reply = "\n".join(lines[1:])
+                        lines = reply.split("\n")
+                        if any([i in lines[0].lower() for i in ["sure", "certainly"]]):
+                            reply = "\n".join(lines[1:])
 
-                    lines = reply.split("\n")
-                    if any([i in lines[0].lower() for i in ["title"]]):
-                        reply = "\n".join(lines[1:])
+                        lines = reply.split("\n")
+                        if any([i in lines[0].lower() for i in ["title"]]):
+                            reply = "\n".join(lines[1:])
 
-                    with open(f"data/essay/{type}/{idx}.txt", "w") as f:
-                        f.write(reply)
+                        with open(out_path, "w") as f:
+                            f.write(reply)
+                        record_result(stats, out_path)
+                    except Exception as e:
+                        record_result(stats, out_path, error=e)
 
     if args.logprobs:
         datasets = [
@@ -940,3 +1063,5 @@ if __name__ == "__main__":
         ]
 
         generate_logprobs(get_generate_dataset(*perturb_datasets))
+
+    print_and_log_summary(stats)
