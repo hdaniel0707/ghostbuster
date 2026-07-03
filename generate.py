@@ -16,7 +16,7 @@ import string
 import torch
 
 # python generate.py --debug --limit 3           # mock LLM calls, first 3 items
-# python generate.py --limit 3 --wp_gpt           # real API calls, first 3 items only
+# uv run python generate.py --limit 10 --wp_gpt           # real API calls, first 3 items only
 
 try:
     import anthropic as _anthropic
@@ -58,10 +58,27 @@ datasets = [
 generate_dataset_fn = get_generate_dataset(*datasets)
 
 prompt_types = ["gpt", "gpt_prompt1", "gpt_prompt2", "gpt_writing", "gpt_semantic"]
+# Maps each gpt_* prompt type to its index in the list returned by get_*_prompts().
+PROMPT_TYPE_INDICES = {
+    "gpt": 0,
+    "gpt_prompt1": 1,
+    "gpt_prompt2": 2,
+    "gpt_writing": 3,
+    "gpt_semantic": 4,
+}
 # Claude only generates the default (unstyled) prompt, not the gpt_prompt1/gpt_prompt2/
-# gpt_writing/gpt_semantic variants. zip(prompt_types_claude, prompts) below then only
-# pairs with prompts[0], the plain prompt each get_*_prompts() returns first.
+# gpt_writing/gpt_semantic variants, so it always uses prompts[0], the plain prompt each
+# get_*_prompts() returns first.
 prompt_types_claude = ["claude"]
+
+
+def prompt_index_for_type(type):
+    return 0 if type == "claude" else PROMPT_TYPE_INDICES[type]
+
+
+def selected_gpt_types(args, prefix):
+    """Return the prompt-type names whose --{prefix}_{type} flag was passed."""
+    return [type for type in PROMPT_TYPE_INDICES if getattr(args, f"{prefix}_{type}")]
 html_replacements = [
     ("&amp;", "&"),
     ("&lt;", "<"),
@@ -224,16 +241,28 @@ if __name__ == "__main__":
 
     parser.add_argument("--wp_prompts", action="store_true")
     parser.add_argument("--wp_human", action="store_true")
-    parser.add_argument("--wp_gpt", action="store_true")
+    parser.add_argument("--wp_gpt", action="store_true", help="Generate the main (unstyled) WP GPT prompt")
+    parser.add_argument("--wp_gpt_prompt1", action="store_true", help="Generate the WP gpt_prompt1 variant")
+    parser.add_argument("--wp_gpt_prompt2", action="store_true", help="Generate the WP gpt_prompt2 variant")
+    parser.add_argument("--wp_gpt_writing", action="store_true", help="Generate the WP gpt_writing variant")
+    parser.add_argument("--wp_gpt_semantic", action="store_true", help="Generate the WP gpt_semantic variant")
     parser.add_argument("--wp_claude", action="store_true")
 
     parser.add_argument("--reuter_human", action="store_true")
-    parser.add_argument("--reuter_gpt", action="store_true")
+    parser.add_argument("--reuter_gpt", action="store_true", help="Generate the main (unstyled) Reuters GPT prompt")
+    parser.add_argument("--reuter_gpt_prompt1", action="store_true", help="Generate the Reuters gpt_prompt1 variant")
+    parser.add_argument("--reuter_gpt_prompt2", action="store_true", help="Generate the Reuters gpt_prompt2 variant")
+    parser.add_argument("--reuter_gpt_writing", action="store_true", help="Generate the Reuters gpt_writing variant")
+    parser.add_argument("--reuter_gpt_semantic", action="store_true", help="Generate the Reuters gpt_semantic variant")
     parser.add_argument("--reuter_claude", action="store_true")
 
     parser.add_argument("--essay_prompts", action="store_true")
     parser.add_argument("--essay_human", action="store_true")
-    parser.add_argument("--essay_gpt", action="store_true")
+    parser.add_argument("--essay_gpt", action="store_true", help="Generate the main (unstyled) essay GPT prompt")
+    parser.add_argument("--essay_gpt_prompt1", action="store_true", help="Generate the essay gpt_prompt1 variant")
+    parser.add_argument("--essay_gpt_prompt2", action="store_true", help="Generate the essay gpt_prompt2 variant")
+    parser.add_argument("--essay_gpt_writing", action="store_true", help="Generate the essay gpt_writing variant")
+    parser.add_argument("--essay_gpt_semantic", action="store_true", help="Generate the essay gpt_semantic variant")
     parser.add_argument("--essay_claude", action="store_true")
 
     parser.add_argument("--logprobs", action="store_true")
@@ -337,10 +366,11 @@ if __name__ == "__main__":
 
             pbar.close()
 
-    if args.wp_gpt or args.wp_claude:
+    wp_gpt_types = selected_gpt_types(args, "wp")
+    if wp_gpt_types or args.wp_claude:
         wp_variants = []
-        if args.wp_gpt:
-            wp_variants.append((prompt_types, args.gpt_model, None))
+        if wp_gpt_types:
+            wp_variants.append((wp_gpt_types, args.gpt_model, None))
         if args.wp_claude:
             wp_variants.append((prompt_types_claude, None, args.claude_model))
 
@@ -361,9 +391,11 @@ if __name__ == "__main__":
             for types, gpt_model, claude_model in wp_variants:
                 prompts = get_wp_prompts(words, prompt)
 
-                for type, variant_prompt in zip(types, prompts):
+                for type in types:
                     if os.path.exists(f"data/wp/{type}/{idx}.txt"):
                         continue
+
+                    variant_prompt = prompts[prompt_index_for_type(type)]
 
                     reply = call_llm(
                         messages=[{"role": "user", "content": variant_prompt}],
@@ -408,10 +440,11 @@ if __name__ == "__main__":
                     with open(f"data/reuter/human/{author}/{n+1}.txt", "w") as f:
                         f.write(doc.strip())
 
-    if args.reuter_gpt or args.reuter_claude:
+    reuter_gpt_types = selected_gpt_types(args, "reuter")
+    if reuter_gpt_types or args.reuter_claude:
         reuter_variants = []
-        if args.reuter_gpt:
-            reuter_variants.append((prompt_types, args.gpt_model, None))
+        if reuter_gpt_types:
+            reuter_variants.append((reuter_gpt_types, args.gpt_model, None))
         if args.reuter_claude:
             reuter_variants.append((prompt_types_claude, None, args.claude_model))
 
@@ -429,12 +462,14 @@ if __name__ == "__main__":
                 for types, gpt_model, claude_model in reuter_variants:
                     prompts = get_reuter_prompts(words, headline)
 
-                    for type, variant_prompt in zip(types, prompts):
+                    for type in types:
                         if not os.path.exists(f"data/reuter/{type}/{author}"):
                             os.makedirs(f"data/reuter/{type}/{author}")
 
                         if os.path.exists(f"data/reuter/{type}/{author}/{idx}.txt"):
                             continue
+
+                        variant_prompt = prompts[prompt_index_for_type(type)]
 
                         reply = call_llm(
                             messages=[{"role": "user", "content": variant_prompt}],
@@ -520,10 +555,11 @@ if __name__ == "__main__":
             with open(f"data/essay/prompts/{idx}.txt", "w") as f:
                 f.write(reply)
 
-    if args.essay_gpt or args.essay_claude:
+    essay_gpt_types = selected_gpt_types(args, "essay")
+    if essay_gpt_types or args.essay_claude:
         essay_variants = []
-        if args.essay_gpt:
-            essay_variants.append((prompt_types, args.gpt_model, None))
+        if essay_gpt_types:
+            essay_variants.append((essay_gpt_types, args.gpt_model, None))
         if args.essay_claude:
             essay_variants.append((prompt_types_claude, None, args.claude_model))
 
@@ -544,9 +580,11 @@ if __name__ == "__main__":
             for types, gpt_model, claude_model in essay_variants:
                 prompts = get_essay_prompts(words, prompt)
 
-                for type, variant_prompt in zip(types, prompts):
+                for type in types:
                     if os.path.exists(f"data/essay/{type}/{idx}.txt"):
                         continue
+
+                    variant_prompt = prompts[prompt_index_for_type(type)]
 
                     reply = call_llm(
                         messages=[{"role": "user", "content": variant_prompt}],
