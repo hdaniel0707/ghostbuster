@@ -213,6 +213,10 @@ def print_and_log_summary(stats, log_path="generate.log"):
         f.write("\n")
 
 
+# Default number of articles to consider per Reuters author when --limit isn't given.
+REUTER_ARTICLES_PER_AUTHOR = 20
+
+
 def round_to_100(n):
     return int(round(n / 100.0)) * 100
 
@@ -486,13 +490,11 @@ if __name__ == "__main__":
     if args.reuter_human:
         reuter_replace = ["--", "202-898-8312", "((", "($1=", "(A$", "Reuters Chicago"]
 
-        authors = os.listdir("data/reuter/raw/C50train")[:limit]
+        authors = os.listdir("data/reuter/raw/C50train")
         print("Formatting Human Reuters documents...")
 
-        for author in tqdm.tqdm(authors):
-            if not os.path.exists(f"data/reuter/human/{author}"):
-                os.makedirs(f"data/reuter/human/{author}")
-
+        author_files = []
+        for author in authors:
             files = [
                 f"data/reuter/raw/C50train/{author}/{i}"
                 for i in os.listdir(f"data/reuter/raw/C50train/{author}")
@@ -500,52 +502,69 @@ if __name__ == "__main__":
                 f"data/reuter/raw/C50test/{author}/{i}"
                 for i in os.listdir(f"data/reuter/raw/C50test/{author}")
             ]
+            author_files.extend(
+                (author, n + 1, file)
+                for n, file in enumerate(files[:REUTER_ARTICLES_PER_AUTHOR])
+            )
 
-            for n, file in enumerate(files[:limit or 20]):
-                with open(file, "r") as f:
-                    doc = f.read().strip()
-                    doc = doc.replace("\n\n", "\n")
+        if limit is not None:
+            author_files = author_files[:limit]
 
-                    lines = doc.split("\n")
-                    if any([i in lines[-1] for i in reuter_replace]):
-                        lines = lines[:-1]
-                    doc = "\n".join(lines)
-                    doc = html_replace(doc)
+        for author, n, file in tqdm.tqdm(author_files):
+            if not os.path.exists(f"data/reuter/human/{author}"):
+                os.makedirs(f"data/reuter/human/{author}")
 
-                    with open(f"data/reuter/human/{author}/{n+1}.txt", "w") as f:
-                        f.write(doc.strip())
+            with open(file, "r") as f:
+                doc = f.read().strip()
+                doc = doc.replace("\n\n", "\n")
+
+                lines = doc.split("\n")
+                if any([i in lines[-1] for i in reuter_replace]):
+                    lines = lines[:-1]
+                doc = "\n".join(lines)
+                doc = html_replace(doc)
+
+                with open(f"data/reuter/human/{author}/{n}.txt", "w") as f:
+                    f.write(doc.strip())
 
     if args.reuter_prompts:
         print("Generating Reuters headlines...")
 
-        authors = os.listdir("data/reuter/human")[:limit]
-        for author in tqdm.tqdm(authors):
+        authors = os.listdir("data/reuter/human")
+        author_idx_pairs = [
+            (author, idx)
+            for author in authors
+            for idx in range(1, REUTER_ARTICLES_PER_AUTHOR + 1)
+        ]
+        if limit is not None:
+            author_idx_pairs = author_idx_pairs[:limit]
+
+        for author, idx in tqdm.tqdm(author_idx_pairs):
             if not os.path.exists(f"data/reuter/gpt/{author}/headlines"):
                 os.makedirs(f"data/reuter/gpt/{author}/headlines")
 
-            for idx in range(1, (limit or 20) + 1):
-                out_path = f"data/reuter/gpt/{author}/headlines/{idx}.txt"
-                if os.path.exists(out_path):
-                    continue
+            out_path = f"data/reuter/gpt/{author}/headlines/{idx}.txt"
+            if os.path.exists(out_path):
+                continue
 
-                with open(f"data/reuter/human/{author}/{idx}.txt", "r") as f:
-                    doc = f.read().strip()
+            with open(f"data/reuter/human/{author}/{idx}.txt", "r") as f:
+                doc = f.read().strip()
 
-                try:
-                    reply = call_llm(
-                        messages=[{"role": "user", "content": f"Given the following news article, write a headline for it. Respond with just the plain headline text, no markdown formatting or asterisks:\n\n{' '.join(doc.split(' ')[:500])}"}],
-                        mode="gpt",
-                        model=args.gpt_model,
-                        debug=args.debug,
-                    )
-                    reply = reply.replace("Headline: ", "").strip()
-                    reply = reply.strip("*").strip()
+            try:
+                reply = call_llm(
+                    messages=[{"role": "user", "content": f"Given the following news article, write a headline for it. Respond with just the plain headline text, no markdown formatting or asterisks:\n\n{' '.join(doc.split(' ')[:500])}"}],
+                    mode="gpt",
+                    model=args.gpt_model,
+                    debug=args.debug,
+                )
+                reply = reply.replace("Headline: ", "").strip()
+                reply = reply.strip("*").strip()
 
-                    with open(out_path, "w") as f:
-                        f.write(reply)
-                    record_result(stats, out_path)
-                except Exception as e:
-                    record_result(stats, out_path, error=e)
+                with open(out_path, "w") as f:
+                    f.write(reply)
+                record_result(stats, out_path)
+            except Exception as e:
+                record_result(stats, out_path, error=e)
 
     reuter_gpt_types = selected_gpt_types(args, "reuter")
     if reuter_gpt_types or args.reuter_claude:
@@ -557,50 +576,57 @@ if __name__ == "__main__":
 
         print("Generating Reuters documents for:", ", ".join(t for types, _, _ in reuter_variants for t in types))
 
-        authors = os.listdir("data/reuter/human")[:limit]
-        for author in tqdm.tqdm(authors):
-            for idx in range(1, (limit or 20) + 1):
-                with open(f"data/reuter/human/{author}/{idx}.txt", "r") as f:
-                    words = round_to_100(len(f.read().split(" ")))
+        authors = os.listdir("data/reuter/human")
+        author_idx_pairs = [
+            (author, idx)
+            for author in authors
+            for idx in range(1, REUTER_ARTICLES_PER_AUTHOR + 1)
+        ]
+        if limit is not None:
+            author_idx_pairs = author_idx_pairs[:limit]
 
-                with open(f"data/reuter/gpt/{author}/headlines/{idx}.txt", "r") as f:
-                    headline = f.read().strip()
+        for author, idx in tqdm.tqdm(author_idx_pairs):
+            with open(f"data/reuter/human/{author}/{idx}.txt", "r") as f:
+                words = round_to_100(len(f.read().split(" ")))
 
-                for types, mode, model in reuter_variants:
-                    prompts = get_reuter_prompts(words, headline)
+            with open(f"data/reuter/gpt/{author}/headlines/{idx}.txt", "r") as f:
+                headline = f.read().strip()
 
-                    for type in types:
-                        if not os.path.exists(f"data/reuter/{type}/{author}"):
-                            os.makedirs(f"data/reuter/{type}/{author}")
+            for types, mode, model in reuter_variants:
+                prompts = get_reuter_prompts(words, headline)
 
-                        out_path = f"data/reuter/{type}/{author}/{idx}.txt"
-                        if os.path.exists(out_path):
-                            continue
+                for type in types:
+                    if not os.path.exists(f"data/reuter/{type}/{author}"):
+                        os.makedirs(f"data/reuter/{type}/{author}")
 
-                        variant_prompt = prompts[prompt_index_for_type(type)]
+                    out_path = f"data/reuter/{type}/{author}/{idx}.txt"
+                    if os.path.exists(out_path):
+                        continue
 
-                        try:
-                            reply = call_llm(
-                                messages=[{"role": "user", "content": variant_prompt}],
-                                mode=mode,
-                                model=model,
-                                debug=args.debug,
-                            )
-                            reply = reply.replace("\n\n", "\n")
+                    variant_prompt = prompts[prompt_index_for_type(type)]
 
-                            lines = reply.split("\n")
-                            if any([i in lines[0].lower() for i in ["sure", "certainly"]]):
-                                reply = "\n".join(lines[1:])
+                    try:
+                        reply = call_llm(
+                            messages=[{"role": "user", "content": variant_prompt}],
+                            mode=mode,
+                            model=model,
+                            debug=args.debug,
+                        )
+                        reply = reply.replace("\n\n", "\n")
 
-                            lines = reply.split("\n")
-                            if any([i in lines[0].lower() for i in ["title"]]):
-                                reply = "\n".join(lines[1:])
+                        lines = reply.split("\n")
+                        if any([i in lines[0].lower() for i in ["sure", "certainly"]]):
+                            reply = "\n".join(lines[1:])
 
-                            with open(out_path, "w") as f:
-                                f.write(reply)
-                            record_result(stats, out_path)
-                        except Exception as e:
-                            record_result(stats, out_path, error=e)
+                        lines = reply.split("\n")
+                        if any([i in lines[0].lower() for i in ["title"]]):
+                            reply = "\n".join(lines[1:])
+
+                        with open(out_path, "w") as f:
+                            f.write(reply)
+                        record_result(stats, out_path)
+                    except Exception as e:
+                        record_result(stats, out_path, error=e)
 
     if args.essay_human or args.essay_gpt:
         essay_dataset = load_dataset("qwedsacf/ivypanda-essays")
