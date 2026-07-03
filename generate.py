@@ -17,7 +17,11 @@ import torch
 from datetime import datetime
 
 # python generate.py --debug --limit 3           # mock LLM calls, first 3 items
-# uv run python generate.py --limit 10 --wp_gpt           # real API calls, first 3 items only
+# uv run python generate.py --reuter_prompts --limit 10 
+# uv run python generate.py --reuter_gpt_plain --limit 10 
+# uv run python generate.py --wp_gpt_plain --limit 10  
+# uv run python generate.py --essay_gpt_plain --limit 10 
+
 
 try:
     import anthropic as _anthropic

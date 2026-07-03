@@ -19,7 +19,7 @@ def openai_backoff(**kwargs):
     return openai.ChatCompletion.create(**kwargs)
 
 
-def generate_documents(output_dir, prompts, verbose=True, force_regenerate=False, model="gpt-3.5-turbo", write_logprobs=False):
+def generate_documents(output_dir, prompts, verbose=True, force_regenerate=False, model="gpt-5.4-mini", write_logprobs=False):
     if write_logprobs and not os.path.exists(f"{output_dir}/logprobs"):
         os.mkdir(f"{output_dir}/logprobs")
 
