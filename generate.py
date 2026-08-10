@@ -20,7 +20,10 @@ from datetime import datetime
 # uv run python generate.py --reuter_prompts --limit 10 
 # uv run python generate.py --reuter_gpt_plain --limit 10 
 # uv run python generate.py --wp_gpt_plain --limit 10  
-# uv run python generate.py --essay_gpt_plain --limit 10 
+# uv run python generate.py --essay_gpt_plain --limit 10
+# uv run python generate.py --essay_gpt_plain --out_name gpt56luna_0701A --limit 10
+#   ^ same prompt, but written to data/essay/gpt56luna_0701A/ so it cannot be
+#     confused with (or skipped because of) another model's gpt_plain run.
 
 
 try:
@@ -85,6 +88,24 @@ def prompt_index_for_type(type):
 def selected_gpt_types(args, prefix):
     """Return the prompt-type names whose --{prefix}_{type} flag was passed."""
     return [type for type in PROMPT_TYPE_INDICES if getattr(args, f"{prefix}_{type}")]
+
+
+def out_dir_for_type(type, args):
+    """The directory under data/<dataset>/ that this type's documents go in.
+
+    Defaults to the type name, which is what every original invocation expects.
+    --out_name overrides it so a run can say which MODEL wrote the documents as
+    well as which prompt: the type name alone is the same for gpt-3.5 and
+    gpt-5.6, and since every loop below skips an output file that already
+    exists, a second model generated into the first one's directory writes
+    nothing at all and looks like a complete run.
+
+    Only the output path changes. The prompt is still chosen by `type`, so
+    --out_name cannot alter what is sent to the model.
+    """
+    return args.out_name or type
+
+
 html_replacements = [
     ("&amp;", "&"),
     ("&lt;", "<"),
@@ -270,6 +291,12 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=None,
                         help="Cap every loop to the first N items. Works with or without --debug, "
                              "so it can be used to test real API calls on a small sample.")
+    parser.add_argument("--out_name", type=str, default=None,
+                        help="Write the generated documents to data/<dataset>/<OUT_NAME>/ instead of "
+                             "data/<dataset>/<type>/. Use it to keep one model's output apart from "
+                             "another's, e.g. --essay_gpt_plain --out_name gpt56luna_0701A. The prompt "
+                             "is still selected by the --<dataset>_<type> flag, so this only renames the "
+                             "output directory. Exactly one type may be selected when it is given.")
 
     parser.add_argument("--wp_prompts", action="store_true")
     parser.add_argument("--wp_human", action="store_true")
@@ -312,6 +339,23 @@ if __name__ == "__main__":
     parser.add_argument("--logprob_perturb_sent", action="store_true")
 
     args = parser.parse_args()
+
+    # --out_name names ONE directory, so it cannot describe two prompts. Two
+    # types selected alongside it would either share a directory (and the
+    # skip-if-exists logic would give all of it to whichever ran first) or need
+    # a name each, which is what running the script twice is for.
+    if args.out_name is not None:
+        selected_types = set()
+        for prefix in ("wp", "reuter", "essay"):
+            selected_types.update(selected_gpt_types(args, prefix))
+            if getattr(args, f"{prefix}_claude"):
+                selected_types.add("claude")
+        if len(selected_types) != 1:
+            parser.error(
+                "--out_name applies to a single generator type, but "
+                f"{len(selected_types)} were selected ({sorted(selected_types) or 'none'}). "
+                "Run once per type."
+            )
 
     if args.debug:
         print("[DEBUG MODE] Mocking all LLM calls.")
@@ -421,8 +465,8 @@ if __name__ == "__main__":
 
         for types, _, _ in wp_variants:
             for type in types:
-                if not os.path.exists(f"data/wp/{type}"):
-                    os.makedirs(f"data/wp/{type}")
+                if not os.path.exists(f"data/wp/{out_dir_for_type(type, args)}"):
+                    os.makedirs(f"data/wp/{out_dir_for_type(type, args)}")
 
         for idx in tqdm.tqdm(range(1, (limit or 1000) + 1)):
             with open(f"data/wp/prompts/{idx}.txt", "r") as f:
@@ -435,7 +479,7 @@ if __name__ == "__main__":
                 prompts = get_wp_prompts(words, prompt)
 
                 for type in types:
-                    out_path = f"data/wp/{type}/{idx}.txt"
+                    out_path = f"data/wp/{out_dir_for_type(type, args)}/{idx}.txt"
                     if os.path.exists(out_path):
                         continue
 
@@ -565,10 +609,14 @@ if __name__ == "__main__":
                 prompts = get_reuter_prompts(words, headline)
 
                 for type in types:
-                    if not os.path.exists(f"data/reuter/{type}/{author}"):
-                        os.makedirs(f"data/reuter/{type}/{author}")
+                    # Note the headline read above comes from data/reuter/gpt/,
+                    # not from here: headlines are a seeded input shared by
+                    # every variant, so --out_name must not move them.
+                    out_dir = out_dir_for_type(type, args)
+                    if not os.path.exists(f"data/reuter/{out_dir}/{author}"):
+                        os.makedirs(f"data/reuter/{out_dir}/{author}")
 
-                    out_path = f"data/reuter/{type}/{author}/{idx}.txt"
+                    out_path = f"data/reuter/{out_dir}/{author}/{idx}.txt"
                     if os.path.exists(out_path):
                         continue
 
@@ -680,8 +728,8 @@ if __name__ == "__main__":
 
         for types, _, _ in essay_variants:
             for type in types:
-                if not os.path.exists(f"data/essay/{type}"):
-                    os.makedirs(f"data/essay/{type}")
+                if not os.path.exists(f"data/essay/{out_dir_for_type(type, args)}"):
+                    os.makedirs(f"data/essay/{out_dir_for_type(type, args)}")
 
         for idx in tqdm.tqdm(range(1, (limit or 1000) + 1)):
             with open(f"data/essay/prompts/{idx}.txt", "r") as f:
@@ -694,7 +742,7 @@ if __name__ == "__main__":
                 prompts = get_essay_prompts(words, prompt)
 
                 for type in types:
-                    out_path = f"data/essay/{type}/{idx}.txt"
+                    out_path = f"data/essay/{out_dir_for_type(type, args)}/{idx}.txt"
                     if os.path.exists(out_path):
                         continue
 

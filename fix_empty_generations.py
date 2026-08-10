@@ -23,6 +23,7 @@ from utils.prompt_utils import get_wp_prompts, get_reuter_prompts, get_essay_pro
 # uv run python fix_empty_generations.py --wp_gpt_plain 
 # uv run python fix_empty_generations.py --essay_gpt_plain
 # uv run python fix_empty_generations.py --reuter_gpt_plain --debug
+# uv run python fix_empty_generations.py --reuter_gpt_plain --out_name gpt56luna_0701A
 
 # --- Copied straight from generate.py so the regenerated file uses the exact
 # same prompt index as the original run. The prompt wording itself lives in
@@ -228,6 +229,11 @@ def build_parser():
                         help="Anthropic model to use when regenerating (must match the original run's model)")
     parser.add_argument("--debug", action="store_true",
                         help="Don't call any real API; write the literal string '[DEBUG]' instead")
+    parser.add_argument("--out_name", type=str, default=None,
+                        help="Look under data/<dataset>/<OUT_NAME>/ instead of data/<dataset>/<type>/, "
+                             "matching generate.py --out_name. The prompt is still chosen by the "
+                             "--<dataset>_<type> flag, so the refill uses the same prompt as the "
+                             "original run.")
 
     return parser
 
@@ -244,7 +250,7 @@ def main():
         )
     dataset, type_ = selected[0]
 
-    root = Path(f"data/{dataset}/{type_}")
+    root = Path(f"data/{dataset}/{args.out_name or type_}")
     empty_files = find_empty_files(root)
 
     if not empty_files:
