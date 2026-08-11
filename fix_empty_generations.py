@@ -44,8 +44,44 @@ def prompt_index_for_type(type_):
     return 0 if type_ == "claude" else PROMPT_TYPE_INDICES[type_]
 
 
+# ANSI, so a file that came back empty AGAIN cannot be mistaken for a success in
+# a wall of green OK lines. Not conditional on a tty: run_full_pipeline.py prints
+# its own colours through the same pipe.
+YELLOW = "\033[33m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+
 def round_to_100(n):
+    """The word budget generate.py asks the model for, from the human length.
+
+    Rounds HALF TO EVEN, because that is what Python's round() does: 50 words
+    becomes 0, not 100, and so does anything shorter. A zero budget is a prompt
+    that says "write a news article in 0 words", which the model answers
+    correctly by returning nothing -- see word_budget() below, which is why this
+    script now refuses to spend a call on one.
+    """
     return int(round(n / 100.0)) * 100
+
+
+def word_budget(path: Path, dataset):
+    """The budget this file's regeneration would ask for, without calling anything.
+
+    Same expression as the regenerate_* functions below, pulled out so main() can
+    see a hopeless file BEFORE paying for it. The human original is the input:
+    the fork sizes every generation against its human partner, so an empty or
+    very short human document asks for an empty machine one.
+    """
+    if dataset == "reuter":
+        author, idx = path.parts[-2], path.stem
+        human = Path(f"data/reuter/human/{author}/{idx}.txt")
+    else:
+        human = Path(f"data/{dataset}/human/{path.stem}.txt")
+    if not human.is_file():
+        return None
+    return round_to_100(len(human.read_text().split(" ")))
 
 # --- LLM calling, mirroring generate.py's call_llm/openai_backoff/claude_backoff,
 # but with lazily-created clients so a --debug or check-only run never needs
@@ -79,12 +115,15 @@ def claude_backoff(**kwargs):
 def call_llm(messages, mode, model, debug=False):
     if debug:
         return "[DEBUG]"
+    # `or ""`: a model that answers with no content at all returns None here, and
+    # a None that reaches .strip() crashes the file with an AttributeError
+    # instead of being reported as the empty reply it is.
     if mode == "gpt":
         response = openai_backoff(model=model, messages=messages)
-        return response.choices[0].message.content.strip()
+        return (response.choices[0].message.content or "").strip()
     elif mode == "claude":
         response = claude_backoff(model=model, max_tokens=2048, messages=messages)
-        return response.content[0].text.strip()
+        return (response.content[0].text if response.content else "").strip()
     else:
         raise ValueError(f"Unknown mode {mode!r}; expected 'gpt' or 'claude'")
 
@@ -133,10 +172,9 @@ def find_empty_files(root: Path):
 # generate.py. ---
 
 
-def regenerate_wp(path: Path, dataset, type_, mode, model, debug):
+def regenerate_wp(path: Path, dataset, type_, mode, model, debug, words):
     idx = path.stem  # e.g. "15"
     prompt = Path(f"data/{dataset}/prompts/{idx}.txt").read_text().strip()
-    words = round_to_100(len(Path(f"data/{dataset}/human/{idx}.txt").read_text().split(" ")))
 
     prompts = get_wp_prompts(words, prompt)
     variant_prompt = prompts[prompt_index_for_type(type_)]
@@ -147,13 +185,15 @@ def regenerate_wp(path: Path, dataset, type_, mode, model, debug):
         model=model,
         debug=debug,
     )
-    return reply.replace("\n\n", "\n")
+    # (raw, cleaned): the raw reply is kept so a reply that survives the API and
+    # is then deleted by post-processing can be told apart from one the model
+    # never sent. Both end as an empty file, and they need different fixes.
+    return reply, reply.replace("\n\n", "\n")
 
 
-def regenerate_essay(path: Path, type_, mode, model, debug):
+def regenerate_essay(path: Path, type_, mode, model, debug, words):
     idx = path.stem
     prompt = Path(f"data/essay/prompts/{idx}.txt").read_text().strip()
-    words = round_to_100(len(Path(f"data/essay/human/{idx}.txt").read_text().split(" ")))
 
     prompts = get_essay_prompts(words, prompt)
     variant_prompt = prompts[prompt_index_for_type(type_)]
@@ -165,13 +205,12 @@ def regenerate_essay(path: Path, type_, mode, model, debug):
         debug=debug,
     )
     if debug:
-        return reply
-    return strip_reuter_essay_boilerplate(reply)
+        return reply, reply
+    return reply, strip_reuter_essay_boilerplate(reply)
 
 
-def regenerate_reuter(path: Path, type_, mode, model, debug):
+def regenerate_reuter(path: Path, type_, mode, model, debug, words):
     author, idx = path.parts[-2], path.stem
-    words = round_to_100(len(Path(f"data/reuter/human/{author}/{idx}.txt").read_text().split(" ")))
     # Headlines are always written under the `gpt` folder regardless of variant
     # (see generate.py's --reuter_prompts block), not under `type_`.
     headline = Path(f"data/reuter/gpt/{author}/headlines/{idx}.txt").read_text().strip()
@@ -186,17 +225,18 @@ def regenerate_reuter(path: Path, type_, mode, model, debug):
         debug=debug,
     )
     if debug:
-        return reply
-    return strip_reuter_essay_boilerplate(reply)
+        return reply, reply
+    return reply, strip_reuter_essay_boilerplate(reply)
 
 
-def regenerate_one(path: Path, dataset, type_, mode, model, debug):
+def regenerate_one(path: Path, dataset, type_, mode, model, debug, words):
+    """``(raw_reply, text_to_write)`` for one file."""
     if dataset == "wp":
-        return regenerate_wp(path, dataset, type_, mode, model, debug)
+        return regenerate_wp(path, dataset, type_, mode, model, debug, words)
     elif dataset == "essay":
-        return regenerate_essay(path, type_, mode, model, debug)
+        return regenerate_essay(path, type_, mode, model, debug, words)
     elif dataset == "reuter":
-        return regenerate_reuter(path, type_, mode, model, debug)
+        return regenerate_reuter(path, type_, mode, model, debug, words)
     else:
         raise ValueError(f"Unknown dataset {dataset!r}")
 
@@ -229,6 +269,11 @@ def build_parser():
                         help="Anthropic model to use when regenerating (must match the original run's model)")
     parser.add_argument("--debug", action="store_true",
                         help="Don't call any real API; write the literal string '[DEBUG]' instead")
+    parser.add_argument("--strict", action="store_true",
+                        help="Exit 1 if any file is still empty afterwards. Off by "
+                             "default: run_full_pipeline.py aborts on a non-zero "
+                             "exit, and the unfixable zero-budget files are present "
+                             "in every run.")
     parser.add_argument("--out_name", type=str, default=None,
                         help="Look under data/<dataset>/<OUT_NAME>/ instead of data/<dataset>/<type>/, "
                              "matching generate.py --out_name. The prompt is still chosen by the "
@@ -254,27 +299,61 @@ def main():
     empty_files = find_empty_files(root)
 
     if not empty_files:
-        print(f"No empty .txt files found under {root}. Nothing to do.")
-        return
+        print(f"{GREEN}No empty .txt files found under {root}. Nothing to do.{RESET}")
+        return 0
+
+    # The budget first, for every file: a zero one is decided by the human
+    # original and no number of retries changes it, so those files are reported
+    # and taken out rather than paid for.
+    budgets = {f: word_budget(f, dataset) for f in empty_files}
+    hopeless = [f for f, w in budgets.items() if w == 0]
+    unknown = [f for f, w in budgets.items() if w is None]
+    retryable = [f for f in empty_files if f not in hopeless and f not in unknown]
 
     print(f"Found {len(empty_files)} empty file(s) under {root}:")
     for i, f in enumerate(empty_files, 1):
-        print(f"  [{i}] {f.relative_to(root)}")
+        words = budgets[f]
+        if words is None:
+            note = f"  {RED}no human original to size it against{RESET}"
+        elif words == 0:
+            note = f"  {YELLOW}<- asks the model for 0 words{RESET}"
+        else:
+            note = f"  {DIM}(asks for {words} words){RESET}"
+        print(f"  [{i}] {str(f.relative_to(root)):<28}{note}")
+
+    if hopeless:
+        print(
+            f"\n{YELLOW}{len(hopeless)} file(s) cannot be refilled.{RESET}\n"
+            "  The prompt asks for round_to_100(human words) words, and their human\n"
+            "  original is 50 words or shorter -- so it rounds to ZERO and the prompt\n"
+            "  reads \"write ... in 0 words\". The model returns nothing, correctly.\n"
+            "  Nothing here can fix that: the human side is a seeded input. Drop the\n"
+            "  pair at training time (the corpus audit reports them), or shorten the\n"
+            "  rounding in utils/prompt_utils.py's callers if a floor is wanted."
+        )
+    if unknown:
+        print(f"\n{RED}{len(unknown)} file(s) have no human original at all:{RESET}")
+        for f in unknown:
+            print(f"  {f.relative_to(root)}")
+
+    if not retryable:
+        print(f"\n{YELLOW}Nothing left to try.{RESET} No API call was made.")
+        return 1 if args.strict else 0
 
     if args.debug:
         print("\n[DEBUG MODE] Regeneration would write the literal string '[DEBUG]' instead of calling a real API.")
 
-    answer = input(f"\nRegenerate these {len(empty_files)} file(s)? [y/N]: ").strip().lower()
+    answer = input(f"\nRegenerate these {len(retryable)} file(s)? [y/N]: ").strip().lower()
     if answer not in ("y", "yes"):
         print("No action taken.")
-        return
+        return 0
 
     mode = "claude" if type_ == "claude" else "gpt"
     model = args.claude_model if mode == "claude" else args.gpt_model
 
-    regenerated, skipped, failed = [], [], []
+    regenerated, skipped, failed, still_empty = [], [], [], []
 
-    for f in empty_files:
+    for f in retryable:
         # Double-check right before regenerating: don't clobber a file that
         # got filled in (by this script or another process) since the scan above.
         if not is_empty(f):
@@ -284,22 +363,66 @@ def main():
 
         print(f"  Confirmed empty: {f.relative_to(root)} -- regenerating...")
         try:
-            reply = regenerate_one(f, dataset, type_, mode, model, args.debug)
-            f.write_text(reply)
-            print(f"  OK    wrote {len(reply.split())} word(s) to {f.relative_to(root)}")
-            regenerated.append(f)
+            raw, text = regenerate_one(
+                f, dataset, type_, mode, model, args.debug, budgets[f]
+            )
         except Exception as e:
-            print(f"  FAIL  {f.relative_to(root)}: {e}")
+            print(f"  {RED}FAIL{RESET}  {f.relative_to(root)}: {e}")
             failed.append((f, e))
+            continue
+
+        # An empty result is the failure this script exists to find, so it is
+        # never written and never counted as a success. Writing it would leave
+        # the file exactly as it was while the summary claimed otherwise.
+        if not text.strip():
+            if raw.strip():
+                # The API answered; post-processing removed all of it. That is a
+                # bug in the boilerplate stripper for this reply, not a model
+                # failure, and the reply is the evidence -- so show it.
+                print(f"  {YELLOW}EMPTY{RESET} {f.relative_to(root)}: the model "
+                      f"replied {len(raw.split())} word(s), but post-processing "
+                      f"removed all of it.\n"
+                      f"        raw reply: {raw.strip()[:200]!r}\n"
+                      f"        strip_reuter_essay_boilerplate() drops the first "
+                      f"line when it looks like a title or an assistant preamble; "
+                      f"a one-line reply loses everything.")
+            else:
+                print(f"  {YELLOW}EMPTY{RESET} {f.relative_to(root)}: the model "
+                      f"returned nothing for a {budgets[f]}-word request. "
+                      f"File left as it was.")
+            still_empty.append(f)
+            continue
+
+        f.write_text(text)
+        print(f"  {GREEN}OK{RESET}    wrote {len(text.split())} word(s) to "
+              f"{f.relative_to(root)}")
+        regenerated.append(f)
 
     print("\n=== Summary ===")
-    print(f"Regenerated: {len(regenerated)}")
+    print(f"{GREEN}Regenerated: {len(regenerated)}{RESET}")
     print(f"Skipped (already filled in): {len(skipped)}")
+    if still_empty:
+        print(f"{YELLOW}Still empty (model returned nothing): {len(still_empty)}{RESET}")
+        for f in still_empty:
+            print(f"  {f.relative_to(root)}")
+    else:
+        print("Still empty (model returned nothing): 0")
+    if hopeless:
+        print(f"{YELLOW}Not attempted (0-word budget): {len(hopeless)}{RESET}")
+        for f in hopeless:
+            print(f"  {f.relative_to(root)}")
     print(f"Failed: {len(failed)}")
     if failed:
         for f, e in failed:
             print(f"  {f.relative_to(root)}: {e}")
 
+    # 0 unless asked to be strict: run_full_pipeline.py aborts the whole run on a
+    # non-zero exit here, and the unfixable essay seeds are present in every
+    # normal run -- they must not stop a pipeline that has nothing else wrong.
+    if args.strict and (still_empty or hopeless or failed):
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
