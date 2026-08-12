@@ -54,25 +54,30 @@ DIM = "\033[2m"
 RESET = "\033[0m"
 
 
-def round_to_100(n):
+# Must match generate.py's WORD_BUDGET_STEP / MIN_WORD_BUDGET exactly, or a
+# refilled file is written to a different length than its neighbours were.
+WORD_BUDGET_STEP = 50
+MIN_WORD_BUDGET = 50
+
+
+def round_to_50(n):
     """The word budget generate.py asks the model for, from the human length.
 
-    Rounds HALF TO EVEN, because that is what Python's round() does: 50 words
-    becomes 0, not 100, and so does anything shorter. A zero budget is a prompt
-    that says "write a news article in 0 words", which the model answers
-    correctly by returning nothing -- see word_budget() below, which is why this
-    script now refuses to spend a call on one.
+    A multiple of 50, never below 50. The floor is the point: this was
+    round_to_100, and round() is HALF TO EVEN, so a 50-word human document gave
+    a budget of 0 -- a prompt reading "write a news article in 0 words", which
+    the model answered correctly by returning nothing. That is the failure this
+    script was written to clean up after; with the floor it cannot happen.
     """
-    return int(round(n / 100.0)) * 100
+    return max(int(round(n / float(WORD_BUDGET_STEP))) * WORD_BUDGET_STEP, MIN_WORD_BUDGET)
 
 
 def word_budget(path: Path, dataset):
     """The budget this file's regeneration would ask for, without calling anything.
 
     Same expression as the regenerate_* functions below, pulled out so main() can
-    see a hopeless file BEFORE paying for it. The human original is the input:
-    the fork sizes every generation against its human partner, so an empty or
-    very short human document asks for an empty machine one.
+    report the budget per file before spending anything, and can tell a file with
+    no human original at all (None) from one that is merely short.
     """
     if dataset == "reuter":
         author, idx = path.parts[-2], path.stem
@@ -81,7 +86,7 @@ def word_budget(path: Path, dataset):
         human = Path(f"data/{dataset}/human/{path.stem}.txt")
     if not human.is_file():
         return None
-    return round_to_100(len(human.read_text().split(" ")))
+    return round_to_50(len(human.read_text().split(" ")))
 
 # --- LLM calling, mirroring generate.py's call_llm/openai_backoff/claude_backoff,
 # but with lazily-created clients so a --debug or check-only run never needs
@@ -269,6 +274,11 @@ def build_parser():
                         help="Anthropic model to use when regenerating (must match the original run's model)")
     parser.add_argument("--debug", action="store_true",
                         help="Don't call any real API; write the literal string '[DEBUG]' instead")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="Skip the confirmation prompt. Use this for any "
+                             "non-interactive run: the prompt is a bare input(), "
+                             "so it reads whatever is queued on stdin -- the next "
+                             "line of a pasted command block included.")
     parser.add_argument("--strict", action="store_true",
                         help="Exit 1 if any file is still empty afterwards. Off by "
                              "default: run_full_pipeline.py aborts on a non-zero "
@@ -306,7 +316,11 @@ def main():
     # original and no number of retries changes it, so those files are reported
     # and taken out rather than paid for.
     budgets = {f: word_budget(f, dataset) for f in empty_files}
-    hopeless = [f for f, w in budgets.items() if w == 0]
+    # Kept as a guard, not as an expected case: round_to_50 floors at
+    # MIN_WORD_BUDGET, so nothing can ask for zero words any more. If this bucket
+    # is ever non-empty, the floor has been removed or bypassed -- which is
+    # exactly the regression worth being told about before paying for a run.
+    hopeless = [f for f, w in budgets.items() if w is not None and w < MIN_WORD_BUDGET]
     unknown = [f for f, w in budgets.items() if w is None]
     retryable = [f for f in empty_files if f not in hopeless and f not in unknown]
 
@@ -315,21 +329,20 @@ def main():
         words = budgets[f]
         if words is None:
             note = f"  {RED}no human original to size it against{RESET}"
-        elif words == 0:
-            note = f"  {YELLOW}<- asks the model for 0 words{RESET}"
+        elif words < MIN_WORD_BUDGET:
+            note = f"  {YELLOW}<- asks the model for {words} words{RESET}"
         else:
             note = f"  {DIM}(asks for {words} words){RESET}"
         print(f"  [{i}] {str(f.relative_to(root)):<28}{note}")
 
     if hopeless:
         print(
-            f"\n{YELLOW}{len(hopeless)} file(s) cannot be refilled.{RESET}\n"
-            "  The prompt asks for round_to_100(human words) words, and their human\n"
-            "  original is 50 words or shorter -- so it rounds to ZERO and the prompt\n"
-            "  reads \"write ... in 0 words\". The model returns nothing, correctly.\n"
-            "  Nothing here can fix that: the human side is a seeded input. Drop the\n"
-            "  pair at training time (the corpus audit reports them), or shorten the\n"
-            "  rounding in utils/prompt_utils.py's callers if a floor is wanted."
+            f"\n{RED}{len(hopeless)} file(s) would ask for fewer than "
+            f"{MIN_WORD_BUDGET} words.{RESET}\n"
+            f"  That should be impossible: round_to_50() floors the budget at\n"
+            f"  MIN_WORD_BUDGET, precisely so a short human original cannot produce a\n"
+            f"  \"write ... in 0 words\" prompt. Check that generate.py and this script\n"
+            f"  still agree on WORD_BUDGET_STEP and MIN_WORD_BUDGET before re-running."
         )
     if unknown:
         print(f"\n{RED}{len(unknown)} file(s) have no human original at all:{RESET}")
@@ -343,10 +356,24 @@ def main():
     if args.debug:
         print("\n[DEBUG MODE] Regeneration would write the literal string '[DEBUG]' instead of calling a real API.")
 
-    answer = input(f"\nRegenerate these {len(retryable)} file(s)? [y/N]: ").strip().lower()
-    if answer not in ("y", "yes"):
-        print("No action taken.")
-        return 0
+    if args.yes:
+        print(f"\nRegenerating {len(retryable)} file(s) (--yes).")
+    else:
+        try:
+            answer = input(
+                f"\nRegenerate these {len(retryable)} file(s)? [y/N]: "
+            ).strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            # Say what was read. A bare input() takes whatever is queued on
+            # stdin, and the usual source of a surprise "no" is the next line of
+            # a pasted command block arriving while this script was still
+            # running -- which looks identical to a deliberate refusal.
+            print(f"{YELLOW}No action taken.{RESET} (read {answer!r} — if you did "
+                  f"not type that, stdin had a queued line: paste one command at "
+                  f"a time, or pass --yes.)")
+            return 0
 
     mode = "claude" if type_ == "claude" else "gpt"
     model = args.claude_model if mode == "claude" else args.gpt_model
@@ -408,7 +435,8 @@ def main():
     else:
         print("Still empty (model returned nothing): 0")
     if hopeless:
-        print(f"{YELLOW}Not attempted (0-word budget): {len(hopeless)}{RESET}")
+        print(f"{RED}Not attempted (budget below {MIN_WORD_BUDGET}): "
+              f"{len(hopeless)}{RESET}")
         for f in hopeless:
             print(f"  {f.relative_to(root)}")
     print(f"Failed: {len(failed)}")
@@ -417,8 +445,8 @@ def main():
             print(f"  {f.relative_to(root)}: {e}")
 
     # 0 unless asked to be strict: run_full_pipeline.py aborts the whole run on a
-    # non-zero exit here, and the unfixable essay seeds are present in every
-    # normal run -- they must not stop a pipeline that has nothing else wrong.
+    # non-zero exit here, and a file the model simply declined to fill must not
+    # stop a pipeline that has nothing else wrong.
     if args.strict and (still_empty or hopeless or failed):
         return 1
     return 0

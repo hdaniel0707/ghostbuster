@@ -14,6 +14,7 @@ import nltk
 import numpy as np
 import string
 import torch
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # python generate.py --debug --limit 3           # mock LLM calls, first 3 items
@@ -169,20 +170,132 @@ def claude_backoff(**kwargs):
 def call_llm(messages, mode, model, debug=False):
     """Call OpenAI or Anthropic depending on `mode` ("gpt" or "claude")."""
     if debug:
-        print(f"  [DEBUG] Skipping API call. Prompt: {messages[-1]['content'][:80]!r}...")
         return "[DEBUG] This is a mock LLM response used for testing."
+    # `or ""` on both branches: a model that answers with no content at all
+    # returns None (OpenAI) or an empty content list (Anthropic), and a None
+    # reaching .strip() raises AttributeError -- which the caller records as a
+    # failed call with no file written, hiding an empty REPLY behind what looks
+    # like a transport error. An empty string is what actually happened.
     if mode == "gpt":
         response = openai_backoff(model=model, messages=messages)
-        return response.choices[0].message.content.strip()
+        return (response.choices[0].message.content or "").strip()
     elif mode == "claude":
         response = claude_backoff(
             model=model,
             max_tokens=2048,
             messages=messages,
         )
-        return response.content[0].text.strip()
+        return (response.content[0].text if response.content else "").strip()
     else:
         raise ValueError(f"Unknown mode {mode!r}; expected 'gpt' or 'claude'")
+
+
+def strip_boilerplate(reply):
+    """Drop an assistant preamble or a title line from a generated document.
+
+    Shared by the reuter and essay loops, which applied identical copies of it
+    inline. ``fix_empty_generations.py`` carries the same function under the
+    name ``strip_reuter_essay_boilerplate``; both must stay in step, or a
+    refilled file is post-processed differently from its neighbours.
+    """
+    reply = reply.replace("\n\n", "\n")
+
+    lines = reply.split("\n")
+    if any(i in lines[0].lower() for i in ["sure", "certainly"]):
+        reply = "\n".join(lines[1:])
+
+    lines = reply.split("\n")
+    if any(i in lines[0].lower() for i in ["title"]):
+        reply = "\n".join(lines[1:])
+
+    return reply
+
+
+def make_call(content, mode, model, debug, post=None):
+    """Build a zero-argument thunk returning the text to write for one document.
+
+    Everything the call depends on -- the finished prompt string, the model, the
+    post-processing -- is captured here, on the main thread, so the thunk itself
+    reads no shared state. That is what makes it safe to hand to a worker: two
+    calls in flight share nothing but the HTTP client, which is thread-safe, and
+    the API itself is stateless, so neither can see the other's content.
+    """
+
+    def _call():
+        reply = call_llm(
+            messages=[{"role": "user", "content": content}],
+            mode=mode,
+            model=model,
+            debug=debug,
+        )
+        return post(reply) if post else reply
+
+    return _call
+
+
+def run_parallel(tasks, workers, desc, stats):
+    """Run ``(out_path, thunk)`` tasks concurrently, writing each result as it lands.
+
+    **Only the network call is parallel.** The worker returns text and does
+    nothing else; the file write and the ``stats`` bookkeeping happen here, on
+    the thread consuming ``as_completed``, so there is no shared mutable state
+    to guard and no lock to get wrong. Results are matched by future identity
+    (``futures[fut]``), never by completion order, so a reply cannot be filed
+    under another document's path.
+
+    The task list is built by the caller *before* any submission, which is where
+    the skip-if-exists check and every ``os.makedirs`` belong: both are
+    read-then-act sequences that race if two threads run them at once.
+
+    Ctrl-C cancels what has not started instead of waiting for it. A bare
+    ``with ThreadPoolExecutor(...)`` calls shutdown(wait=True) on the way out,
+    so an interrupt with a thousand tasks queued appears to hang.
+    """
+    tasks = list(tasks)
+    if not tasks:
+        return
+
+    # Two tasks writing one path would both run and both write, and the file
+    # would hold whichever reply finished last -- a paid-for document silently
+    # discarded. The loops below cannot produce one (a path is (type, index),
+    # and --out_name is restricted to a single type), so this is a guard against
+    # a future loop, not a known case.
+    seen, repeated = set(), set()
+    for out_path, _ in tasks:
+        if out_path in seen:
+            repeated.add(out_path)
+        seen.add(out_path)
+    if repeated:
+        duplicates = sorted(repeated)
+        raise ValueError(
+            f"{len(duplicates)} output path(s) claimed by more than one task, "
+            f"e.g. {duplicates[:3]}. Each document must have its own path."
+        )
+
+    pool = ThreadPoolExecutor(max_workers=max(1, workers))
+    futures = {pool.submit(thunk): out_path for out_path, thunk in tasks}
+    try:
+        for fut in tqdm.tqdm(as_completed(futures), total=len(futures), desc=desc):
+            out_path = futures[fut]
+            try:
+                text = fut.result()
+                with open(out_path, "w") as f:
+                    f.write(text)
+            except Exception as e:
+                record_result(stats, out_path, error=e)
+                continue
+            if not text.strip():
+                # The file is written either way, so fix_empty_generations.py can
+                # find and refill it -- but it is not a document, and counting it
+                # as one is how a run reports 1000 created and yields 999.
+                record_result(stats, out_path, error="empty reply")
+            else:
+                record_result(stats, out_path)
+    except KeyboardInterrupt:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
 
 
 def record_result(stats, path, error=None):
@@ -227,7 +340,10 @@ def print_and_log_summary(stats, log_path="generate.log"):
 
         lines.append("")
         lines.append("Missed files:")
-        for path, error in stats["missed"]:
+        # Sorted, not in the order they were recorded: with --workers > 1 that
+        # order is whichever call finished first, so two runs over the same
+        # failures produce logs that cannot be diffed.
+        for path, error in sorted(stats["missed"]):
             lines.append(f"  {path}: {error}")
 
     summary = "\n".join(lines)
@@ -243,8 +359,27 @@ def print_and_log_summary(stats, log_path="generate.log"):
 REUTER_ARTICLES_PER_AUTHOR = 20
 
 
-def round_to_100(n):
-    return int(round(n / 100.0)) * 100
+# The word budget asked of the model is the human partner's length, rounded to
+# this step and never allowed below it. Both numbers are 50 deliberately:
+#
+#   THE STEP was 100, which is coarse enough to matter at the short end -- a
+#   450-word article and a 549-word one were both asked for 500. 50 tracks the
+#   human length about twice as closely, at no cost.
+#
+#   THE FLOOR is what stops the bug this replaces. round() is HALF TO EVEN, so
+#   round_to_100(50) was 0, not 100, and so was anything shorter: the prompt
+#   read "write a news article in 0 words", which the model answered correctly
+#   by returning nothing. One reuter article (AaronPressman/16, 50 tokens by
+#   split(" ")) and the six blank essay seeds landed on exactly that. Half-to-
+#   even still applies here -- round_to_50(75) is 100 -- but with a floor no
+#   input can reach zero, so the failure cannot recur.
+WORD_BUDGET_STEP = 50
+MIN_WORD_BUDGET = 50
+
+
+def round_to_50(n):
+    """The word budget for a human document of `n` words: a multiple of 50, >= 50."""
+    return max(int(round(n / float(WORD_BUDGET_STEP))) * WORD_BUDGET_STEP, MIN_WORD_BUDGET)
 
 
 def generate_logprobs(generate_dataset_fn, llama_7b_model=None, llama_13b_model=None):
@@ -291,6 +426,12 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=None,
                         help="Cap every loop to the first N items. Works with or without --debug, "
                              "so it can be used to test real API calls on a small sample.")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Concurrent API calls (default: 8). Each call is an independent, "
+                             "stateless request built before submission, so concurrency cannot "
+                             "mix one document's inputs into another's. Use 1 to make the run "
+                             "strictly sequential; raise it only as far as the account's rate "
+                             "limit allows, since a 429 costs a retry with backoff.")
     parser.add_argument("--out_name", type=str, default=None,
                         help="Write the generated documents to data/<dataset>/<OUT_NAME>/ instead of "
                              "data/<dataset>/<type>/. Use it to keep one model's output apart from "
@@ -375,37 +516,24 @@ if __name__ == "__main__":
             return p.strip()
 
         wp_limit = limit or 1000
+        print("Generating and writing WP prompts...")
+
+        tasks = []
         with open("data/wp/raw/train.wp_source", "r") as f:
-            num_lines_read = 0
-
-            print("Generating and writing WP prompts...")
-
-            pbar = tqdm.tqdm(total=wp_limit)
-            for prompt in f:
+            for num_lines_read, prompt in enumerate(f):
                 if num_lines_read >= wp_limit:
                     break
 
                 input_prompt = format_prompt(prompt)
-                out_path = f"data/wp/prompts/{num_lines_read + 1}.txt"
+                tasks.append((
+                    f"data/wp/prompts/{num_lines_read + 1}.txt",
+                    make_call(
+                        f"Remove all the formatting in this prompt:\n\n{input_prompt}",
+                        "gpt", args.gpt_model, args.debug,
+                    ),
+                ))
 
-                try:
-                    reply = call_llm(
-                        messages=[{"role": "user", "content": f"Remove all the formatting in this prompt:\n\n{input_prompt}"}],
-                        mode="gpt",
-                        model=args.gpt_model,
-                        debug=args.debug,
-                    )
-
-                    with open(out_path, "w") as out_f:
-                        out_f.write(reply)
-                    record_result(stats, out_path)
-                except Exception as e:
-                    record_result(stats, out_path, error=e)
-
-                num_lines_read += 1
-                pbar.update(1)
-
-            pbar.close()
+        run_parallel(tasks, args.workers, "wp prompts", stats)
 
     if args.wp_human:
         print("Formatting Human WP documents...")
@@ -463,42 +591,42 @@ if __name__ == "__main__":
 
         print("Generating WP documents for:", ", ".join(t for types, _, _ in wp_variants for t in types))
 
+        # exist_ok, and out here rather than inside the per-item loop: the
+        # `if not exists: makedirs` pattern is a race between threads, and the
+        # directory set is known before the first task anyway.
         for types, _, _ in wp_variants:
             for type in types:
-                if not os.path.exists(f"data/wp/{out_dir_for_type(type, args)}"):
-                    os.makedirs(f"data/wp/{out_dir_for_type(type, args)}")
+                os.makedirs(f"data/wp/{out_dir_for_type(type, args)}", exist_ok=True)
 
-        for idx in tqdm.tqdm(range(1, (limit or 1000) + 1)):
+        tasks = []
+        for idx in range(1, (limit or 1000) + 1):
             with open(f"data/wp/prompts/{idx}.txt", "r") as f:
                 prompt = f.read().strip()
 
             with open(f"data/wp/human/{idx}.txt", "r") as f:
-                words = round_to_100(len(f.read().split(" ")))
+                words = round_to_50(len(f.read().split(" ")))
 
             for types, mode, model in wp_variants:
                 prompts = get_wp_prompts(words, prompt)
 
                 for type in types:
                     out_path = f"data/wp/{out_dir_for_type(type, args)}/{idx}.txt"
+                    # Resume check stays on the main thread, before submission:
+                    # a worker doing exists-then-write would race with the write
+                    # of whatever else is in flight for the same path.
                     if os.path.exists(out_path):
                         continue
 
-                    variant_prompt = prompts[prompt_index_for_type(type)]
+                    tasks.append((
+                        out_path,
+                        make_call(
+                            prompts[prompt_index_for_type(type)],
+                            mode, model, args.debug,
+                            post=lambda reply: reply.replace("\n\n", "\n"),
+                        ),
+                    ))
 
-                    try:
-                        reply = call_llm(
-                            messages=[{"role": "user", "content": variant_prompt}],
-                            mode=mode,
-                            model=model,
-                            debug=args.debug,
-                        )
-                        reply = reply.replace("\n\n", "\n")
-
-                        with open(out_path, "w") as f:
-                            f.write(reply)
-                        record_result(stats, out_path)
-                    except Exception as e:
-                        record_result(stats, out_path, error=e)
+        run_parallel(tasks, args.workers, "wp documents", stats)
 
     if args.reuter_human:
         reuter_replace = ["--", "202-898-8312", "((", "($1=", "(A$", "Reuters Chicago"]
@@ -552,9 +680,12 @@ if __name__ == "__main__":
         if limit is not None:
             author_idx_pairs = author_idx_pairs[:limit]
 
-        for author, idx in tqdm.tqdm(author_idx_pairs):
-            if not os.path.exists(f"data/reuter/gpt/{author}/headlines"):
-                os.makedirs(f"data/reuter/gpt/{author}/headlines")
+        def clean_headline(reply):
+            return reply.replace("Headline: ", "").strip().strip("*").strip()
+
+        tasks = []
+        for author, idx in author_idx_pairs:
+            os.makedirs(f"data/reuter/gpt/{author}/headlines", exist_ok=True)
 
             out_path = f"data/reuter/gpt/{author}/headlines/{idx}.txt"
             if os.path.exists(out_path):
@@ -563,21 +694,18 @@ if __name__ == "__main__":
             with open(f"data/reuter/human/{author}/{idx}.txt", "r") as f:
                 doc = f.read().strip()
 
-            try:
-                reply = call_llm(
-                    messages=[{"role": "user", "content": f"Given the following news article, write a headline for it. Respond with just the plain headline text, no markdown formatting or asterisks:\n\n{' '.join(doc.split(' ')[:500])}"}],
-                    mode="gpt",
-                    model=args.gpt_model,
-                    debug=args.debug,
-                )
-                reply = reply.replace("Headline: ", "").strip()
-                reply = reply.strip("*").strip()
+            tasks.append((
+                out_path,
+                make_call(
+                    "Given the following news article, write a headline for it. "
+                    "Respond with just the plain headline text, no markdown "
+                    f"formatting or asterisks:\n\n{' '.join(doc.split(' ')[:500])}",
+                    "gpt", args.gpt_model, args.debug,
+                    post=clean_headline,
+                ),
+            ))
 
-                with open(out_path, "w") as f:
-                    f.write(reply)
-                record_result(stats, out_path)
-            except Exception as e:
-                record_result(stats, out_path, error=e)
+        run_parallel(tasks, args.workers, "reuter headlines", stats)
 
     reuter_gpt_types = selected_gpt_types(args, "reuter")
     if reuter_gpt_types or args.reuter_claude:
@@ -598,9 +726,10 @@ if __name__ == "__main__":
         if limit is not None:
             author_idx_pairs = author_idx_pairs[:limit]
 
-        for author, idx in tqdm.tqdm(author_idx_pairs):
+        tasks = []
+        for author, idx in author_idx_pairs:
             with open(f"data/reuter/human/{author}/{idx}.txt", "r") as f:
-                words = round_to_100(len(f.read().split(" ")))
+                words = round_to_50(len(f.read().split(" ")))
 
             with open(f"data/reuter/gpt/{author}/headlines/{idx}.txt", "r") as f:
                 headline = f.read().strip()
@@ -613,37 +742,22 @@ if __name__ == "__main__":
                     # not from here: headlines are a seeded input shared by
                     # every variant, so --out_name must not move them.
                     out_dir = out_dir_for_type(type, args)
-                    if not os.path.exists(f"data/reuter/{out_dir}/{author}"):
-                        os.makedirs(f"data/reuter/{out_dir}/{author}")
+                    os.makedirs(f"data/reuter/{out_dir}/{author}", exist_ok=True)
 
                     out_path = f"data/reuter/{out_dir}/{author}/{idx}.txt"
                     if os.path.exists(out_path):
                         continue
 
-                    variant_prompt = prompts[prompt_index_for_type(type)]
+                    tasks.append((
+                        out_path,
+                        make_call(
+                            prompts[prompt_index_for_type(type)],
+                            mode, model, args.debug,
+                            post=strip_boilerplate,
+                        ),
+                    ))
 
-                    try:
-                        reply = call_llm(
-                            messages=[{"role": "user", "content": variant_prompt}],
-                            mode=mode,
-                            model=model,
-                            debug=args.debug,
-                        )
-                        reply = reply.replace("\n\n", "\n")
-
-                        lines = reply.split("\n")
-                        if any([i in lines[0].lower() for i in ["sure", "certainly"]]):
-                            reply = "\n".join(lines[1:])
-
-                        lines = reply.split("\n")
-                        if any([i in lines[0].lower() for i in ["title"]]):
-                            reply = "\n".join(lines[1:])
-
-                        with open(out_path, "w") as f:
-                            f.write(reply)
-                        record_result(stats, out_path)
-                    except Exception as e:
-                        record_result(stats, out_path, error=e)
+        run_parallel(tasks, args.workers, "reuter documents", stats)
 
     if args.essay_human or args.essay_gpt:
         essay_dataset = load_dataset("qwedsacf/ivypanda-essays")
@@ -695,26 +809,22 @@ if __name__ == "__main__":
     if args.essay_prompts:
         print("Generating Essay prompts...")
 
-        for idx in tqdm.tqdm(range(1, (limit or 1000) + 1)):
-            out_path = f"data/essay/prompts/{idx}.txt"
-
+        tasks = []
+        for idx in range(1, (limit or 1000) + 1):
             with open(f"data/essay/human/{idx}.txt", "r") as f:
                 doc = f.read().strip()
 
-            try:
-                reply = call_llm(
-                    messages=[{"role": "user", "content": f"Given the following essay, write a prompt for it:\n\n{' '.join(doc.split(' ')[:500])}"}],
-                    mode="gpt",
-                    model=args.gpt_model,
-                    debug=args.debug,
-                )
-                reply = reply.replace("Prompt: ", "").strip()
+            tasks.append((
+                f"data/essay/prompts/{idx}.txt",
+                make_call(
+                    "Given the following essay, write a prompt for it:\n\n"
+                    f"{' '.join(doc.split(' ')[:500])}",
+                    "gpt", args.gpt_model, args.debug,
+                    post=lambda reply: reply.replace("Prompt: ", "").strip(),
+                ),
+            ))
 
-                with open(out_path, "w") as f:
-                    f.write(reply)
-                record_result(stats, out_path)
-            except Exception as e:
-                record_result(stats, out_path, error=e)
+        run_parallel(tasks, args.workers, "essay prompts", stats)
 
     essay_gpt_types = selected_gpt_types(args, "essay")
     if essay_gpt_types or args.essay_claude:
@@ -728,15 +838,15 @@ if __name__ == "__main__":
 
         for types, _, _ in essay_variants:
             for type in types:
-                if not os.path.exists(f"data/essay/{out_dir_for_type(type, args)}"):
-                    os.makedirs(f"data/essay/{out_dir_for_type(type, args)}")
+                os.makedirs(f"data/essay/{out_dir_for_type(type, args)}", exist_ok=True)
 
-        for idx in tqdm.tqdm(range(1, (limit or 1000) + 1)):
+        tasks = []
+        for idx in range(1, (limit or 1000) + 1):
             with open(f"data/essay/prompts/{idx}.txt", "r") as f:
                 prompt = f.read().strip()
 
             with open(f"data/essay/human/{idx}.txt", "r") as f:
-                words = round_to_100(len(f.read().split(" ")))
+                words = round_to_50(len(f.read().split(" ")))
 
             for types, mode, model in essay_variants:
                 prompts = get_essay_prompts(words, prompt)
@@ -746,30 +856,16 @@ if __name__ == "__main__":
                     if os.path.exists(out_path):
                         continue
 
-                    variant_prompt = prompts[prompt_index_for_type(type)]
+                    tasks.append((
+                        out_path,
+                        make_call(
+                            prompts[prompt_index_for_type(type)],
+                            mode, model, args.debug,
+                            post=strip_boilerplate,
+                        ),
+                    ))
 
-                    try:
-                        reply = call_llm(
-                            messages=[{"role": "user", "content": variant_prompt}],
-                            mode=mode,
-                            model=model,
-                            debug=args.debug,
-                        )
-                        reply = reply.replace("\n\n", "\n")
-
-                        lines = reply.split("\n")
-                        if any([i in lines[0].lower() for i in ["sure", "certainly"]]):
-                            reply = "\n".join(lines[1:])
-
-                        lines = reply.split("\n")
-                        if any([i in lines[0].lower() for i in ["title"]]):
-                            reply = "\n".join(lines[1:])
-
-                        with open(out_path, "w") as f:
-                            f.write(reply)
-                        record_result(stats, out_path)
-                    except Exception as e:
-                        record_result(stats, out_path, error=e)
+        run_parallel(tasks, args.workers, "essay documents", stats)
 
     if args.logprobs:
         datasets = [
