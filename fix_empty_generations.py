@@ -133,9 +133,19 @@ def call_llm(messages, mode, model, debug=False):
         raise ValueError(f"Unknown mode {mode!r}; expected 'gpt' or 'claude'")
 
 
-def strip_reuter_essay_boilerplate(reply):
-    """Same post-processing generate.py applies to reuter/essay replies."""
+def strip_reuter_essay_boilerplate(reply, drop_preamble=False):
+    """Same post-processing generate.py applies to reuter/essay replies.
+
+    Must stay in step with ``generate.strip_boilerplate``, including the
+    default: a refill post-processed differently from its neighbours is a
+    document that does not belong in the corpus it sits in.
+    """
     reply = reply.replace("\n\n", "\n")
+
+    if not drop_preamble:
+        return reply
+
+    original = reply
 
     lines = reply.split("\n")
     if any(i in lines[0].lower() for i in ["sure", "certainly"]):
@@ -144,6 +154,12 @@ def strip_reuter_essay_boilerplate(reply):
     lines = reply.split("\n")
     if any(i in lines[0].lower() for i in ["title"]):
         reply = "\n".join(lines[1:])
+
+    # See generate.strip_boilerplate: dropping line 0 of a single-paragraph
+    # reply drops the document. Returning the unstripped reply is what stops
+    # this script looping forever on a file it can never fill.
+    if not reply.strip():
+        return original
 
     return reply
 
@@ -196,7 +212,7 @@ def regenerate_wp(path: Path, dataset, type_, mode, model, debug, words):
     return reply, reply.replace("\n\n", "\n")
 
 
-def regenerate_essay(path: Path, type_, mode, model, debug, words):
+def regenerate_essay(path: Path, type_, mode, model, debug, words, drop_preamble=False):
     idx = path.stem
     prompt = Path(f"data/essay/prompts/{idx}.txt").read_text().strip()
 
@@ -211,10 +227,10 @@ def regenerate_essay(path: Path, type_, mode, model, debug, words):
     )
     if debug:
         return reply, reply
-    return reply, strip_reuter_essay_boilerplate(reply)
+    return reply, strip_reuter_essay_boilerplate(reply, drop_preamble)
 
 
-def regenerate_reuter(path: Path, type_, mode, model, debug, words):
+def regenerate_reuter(path: Path, type_, mode, model, debug, words, drop_preamble=False):
     author, idx = path.parts[-2], path.stem
     # Headlines are always written under the `gpt` folder regardless of variant
     # (see generate.py's --reuter_prompts block), not under `type_`.
@@ -231,17 +247,19 @@ def regenerate_reuter(path: Path, type_, mode, model, debug, words):
     )
     if debug:
         return reply, reply
-    return reply, strip_reuter_essay_boilerplate(reply)
+    return reply, strip_reuter_essay_boilerplate(reply, drop_preamble)
 
 
-def regenerate_one(path: Path, dataset, type_, mode, model, debug, words):
+def regenerate_one(path: Path, dataset, type_, mode, model, debug, words,
+                   drop_preamble=False):
     """``(raw_reply, text_to_write)`` for one file."""
     if dataset == "wp":
+        # wp never had the line-dropping, so drop_preamble does not reach it.
         return regenerate_wp(path, dataset, type_, mode, model, debug, words)
     elif dataset == "essay":
-        return regenerate_essay(path, type_, mode, model, debug, words)
+        return regenerate_essay(path, type_, mode, model, debug, words, drop_preamble)
     elif dataset == "reuter":
-        return regenerate_reuter(path, type_, mode, model, debug, words)
+        return regenerate_reuter(path, type_, mode, model, debug, words, drop_preamble)
     else:
         raise ValueError(f"Unknown dataset {dataset!r}")
 
@@ -284,6 +302,14 @@ def build_parser():
                              "default: run_full_pipeline.py aborts on a non-zero "
                              "exit, and the unfixable zero-budget files are present "
                              "in every run.")
+    parser.add_argument("--strip_boilerplate", action="store_true",
+                        help="Drop the first line of a reuter/essay reply when it "
+                             "contains 'sure', 'certainly' or 'title'. OFF BY "
+                             "DEFAULT, and must match the flag the original "
+                             "generate.py run used, or the refill is "
+                             "post-processed differently from its neighbours. "
+                             "See generate.py --strip_boilerplate for why it is "
+                             "off.")
     parser.add_argument("--out_name", type=str, default=None,
                         help="Look under data/<dataset>/<OUT_NAME>/ instead of data/<dataset>/<type>/, "
                              "matching generate.py --out_name. The prompt is still chosen by the "
@@ -391,7 +417,8 @@ def main():
         print(f"  Confirmed empty: {f.relative_to(root)} -- regenerating...")
         try:
             raw, text = regenerate_one(
-                f, dataset, type_, mode, model, args.debug, budgets[f]
+                f, dataset, type_, mode, model, args.debug, budgets[f],
+                args.strip_boilerplate,
             )
         except Exception as e:
             print(f"  {RED}FAIL{RESET}  {f.relative_to(root)}: {e}")
@@ -403,16 +430,19 @@ def main():
         # the file exactly as it was while the summary claimed otherwise.
         if not text.strip():
             if raw.strip():
-                # The API answered; post-processing removed all of it. That is a
-                # bug in the boilerplate stripper for this reply, not a model
-                # failure, and the reply is the evidence -- so show it.
+                # The API answered; post-processing removed all of it. Kept as a
+                # guard, not as an expected case: the only step that could do
+                # this was the preamble drop, which is now off by default and
+                # returns the unstripped reply rather than nothing when it would
+                # empty a document. Reaching this means that guard is gone.
                 print(f"  {YELLOW}EMPTY{RESET} {f.relative_to(root)}: the model "
                       f"replied {len(raw.split())} word(s), but post-processing "
                       f"removed all of it.\n"
                       f"        raw reply: {raw.strip()[:200]!r}\n"
-                      f"        strip_reuter_essay_boilerplate() drops the first "
-                      f"line when it looks like a title or an assistant preamble; "
-                      f"a one-line reply loses everything.")
+                      f"        That should no longer be possible: "
+                      f"strip_reuter_essay_boilerplate() only drops the first "
+                      f"line under --strip_boilerplate, and never returns an "
+                      f"empty document. Check that guard before re-running.")
             else:
                 print(f"  {YELLOW}EMPTY{RESET} {f.relative_to(root)}: the model "
                       f"returned nothing for a {budgets[f]}-word request. "

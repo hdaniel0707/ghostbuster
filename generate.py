@@ -16,6 +16,7 @@ import string
 import torch
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from functools import partial
 
 # python generate.py --debug --limit 3           # mock LLM calls, first 3 items
 # uv run python generate.py --reuter_prompts --limit 10 
@@ -190,15 +191,24 @@ def call_llm(messages, mode, model, debug=False):
         raise ValueError(f"Unknown mode {mode!r}; expected 'gpt' or 'claude'")
 
 
-def strip_boilerplate(reply):
-    """Drop an assistant preamble or a title line from a generated document.
+def strip_boilerplate(reply, drop_preamble=False):
+    """Collapse blank lines, and optionally drop a preamble or title line.
 
     Shared by the reuter and essay loops, which applied identical copies of it
     inline. ``fix_empty_generations.py`` carries the same function under the
     name ``strip_reuter_essay_boilerplate``; both must stay in step, or a
     refilled file is post-processed differently from its neighbours.
+
+    THE BLANK-LINE COLLAPSE IS UNCONDITIONAL. Only the line-dropping below is
+    behind ``drop_preamble``, and it defaults to OFF because it does far more
+    harm than good on this corpus -- see the flag's help in the parser.
     """
     reply = reply.replace("\n\n", "\n")
+
+    if not drop_preamble:
+        return reply
+
+    original = reply
 
     lines = reply.split("\n")
     if any(i in lines[0].lower() for i in ["sure", "certainly"]):
@@ -207,6 +217,15 @@ def strip_boilerplate(reply):
     lines = reply.split("\n")
     if any(i in lines[0].lower() for i in ["title"]):
         reply = "\n".join(lines[1:])
+
+    # Never hand back nothing. A single-paragraph reply is ONE line here (the
+    # collapse above joined its paragraphs), so dropping line 0 drops the whole
+    # document -- which is how a 152-word essay became a 0-byte file that
+    # fix_empty_generations.py could then never refill, because it re-ran the
+    # same stripper and got the same empty string. This is a deliberate
+    # deviation from upstream, which wrote the empty string out.
+    if not reply.strip():
+        return original
 
     return reply
 
@@ -468,6 +487,19 @@ if __name__ == "__main__":
     parser.add_argument("--essay_gpt_semantic", action="store_true", help="Generate the essay gpt_semantic variant")
     parser.add_argument("--essay_gpt_plain", action="store_true", help="Generate the essay gpt_plain variant (no markdown formatting, for AI-detector datasets)")
     parser.add_argument("--essay_claude", action="store_true")
+
+    parser.add_argument(
+        "--strip_boilerplate", action="store_true",
+        help="Drop the first line of a reuter/essay reply when it contains "
+             "'sure', 'certainly' or 'title'. OFF BY DEFAULT, and best left "
+             "off: the test is a SUBSTRING match on the whole first line, so "
+             "it fires on 'ensure', 'measure', 'pressure' and 'entitled', and "
+             "after blank-line collapsing the first line of a "
+             "single-paragraph reply IS the whole document. Measured against "
+             "the human corpus, roughly 9%% of essay and 3%% of reuter first "
+             "paragraphs contain one of those substrings. This was upstream "
+             "Ghostbuster's behaviour and is kept only to reproduce corpora "
+             "built before it was made optional.")
 
     parser.add_argument("--logprobs", action="store_true")
     parser.add_argument("--logprob_other", action="store_true")
@@ -753,7 +785,8 @@ if __name__ == "__main__":
                         make_call(
                             prompts[prompt_index_for_type(type)],
                             mode, model, args.debug,
-                            post=strip_boilerplate,
+                            post=partial(strip_boilerplate,
+                                         drop_preamble=args.strip_boilerplate),
                         ),
                     ))
 
@@ -861,7 +894,8 @@ if __name__ == "__main__":
                         make_call(
                             prompts[prompt_index_for_type(type)],
                             mode, model, args.debug,
-                            post=strip_boilerplate,
+                            post=partial(strip_boilerplate,
+                                         drop_preamble=args.strip_boilerplate),
                         ),
                     ))
 
