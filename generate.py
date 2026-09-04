@@ -49,6 +49,7 @@ from utils.write_logprobs import write_logprobs, write_llama_logprobs
 from utils.symbolic import convert_file_to_logprob_file
 from utils.load import Dataset, get_generate_dataset
 from utils.prompt_utils import get_wp_prompts, get_reuter_prompts, get_essay_prompts
+from utils.env_utils import resolve_endpoint
 
 
 nltk.download("wordnet")
@@ -152,7 +153,11 @@ def html_replace(text):
     return text
 
 
-_openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# Built in __main__, once the endpoint is resolved from --provider /
+# --base_url / --api_key_env -- so a single invocation (one model, one
+# endpoint, per the --out_name contract already documented above) needs one
+# client, built once, before any worker thread can read it.
+_openai_client = None
 
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
@@ -440,6 +445,22 @@ if __name__ == "__main__":
                         help="OpenAI model to use for generation")
     parser.add_argument("--claude_model", type=str, default="claude-sonnet-5",
                         help="Anthropic Claude model to use instead of OpenAI")
+    parser.add_argument("--provider", type=str, default=None,
+                        choices=["openai", "genai4science"],
+                        help="Which OpenAI-compatible host serves --gpt_model. "
+                             "Omitted or 'openai' calls OpenAI itself with "
+                             "OPENAI_API_KEY, unchanged from before this flag "
+                             "existed. 'genai4science' calls HUN-REN SZTAKI's "
+                             "endpoint (GENAI4SCIENCE_API_KEY, or "
+                             "GENAI4SCIENCE_PERFORMANCE_API_KEY when set, which "
+                             "wins). Ignored for --*_claude.")
+    parser.add_argument("--base_url", type=str, default=None,
+                        help="Call this OpenAI-compatible base URL instead of "
+                             "OpenAI's own, for a host --provider has no "
+                             "shorthand for. Must be given together with "
+                             "--api_key_env.")
+    parser.add_argument("--api_key_env", type=str, default=None,
+                        help="Env var holding the API key for --base_url.")
     parser.add_argument("--debug", action="store_true",
                         help="Debug mode: mock all LLM calls instead of making real API calls")
     parser.add_argument("--limit", type=int, default=None,
@@ -512,6 +533,23 @@ if __name__ == "__main__":
     parser.add_argument("--logprob_perturb_sent", action="store_true")
 
     args = parser.parse_args()
+
+    # Resolved once, here, and used for every --gpt_model call this invocation
+    # makes -- consistent with --out_name already restricting one invocation to
+    # one generator type. Skipped under --debug: no LLM call is ever made, so no
+    # key is needed either (this is a relaxation of the previous behaviour,
+    # which built an OpenAI client -- unused under --debug -- unconditionally).
+    if not args.debug:
+        base_url, api_key_env = resolve_endpoint(
+            args.provider, args.base_url, args.api_key_env
+        )
+        api_key = os.environ.get(api_key_env)
+        if not api_key:
+            parser.error(
+                f"{api_key_env} is not set -- required by --gpt_model "
+                f"{args.gpt_model!r} (--provider {args.provider!r})"
+            )
+        _openai_client = openai.OpenAI(api_key=api_key, base_url=base_url)
 
     # --out_name names ONE directory, so it cannot describe two prompts. Two
     # types selected alongside it would either share a directory (and the

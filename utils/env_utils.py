@@ -3,6 +3,65 @@ import os
 from dotenv import dotenv_values
 
 
+# --- OpenAI-compatible endpoint routing, for generate.py / fix_empty_generations.py ---
+#
+# Mirrors epai/utils/env_utils.py::genai4science_endpoint() in the main repo.
+# Duplicated rather than imported: this fork runs in its own uv environment and
+# cannot import across that boundary (see the main repo's
+# epai/ghostbuster/run_full_pipeline.py). Keep the two in step if the endpoint
+# changes.
+GENAI4SCIENCE_BASE_URL = "https://genai.science-cloud.hu/api"
+GENAI4SCIENCE_PERFORMANCE_BASE_URL = "https://genai.science-cloud.hu/performance-api/"
+
+
+def genai4science_endpoint() -> tuple[str, str]:
+    """``(base_url, api_key_env)`` for the GenAI4Science endpoint.
+
+    Prefers the **performance** endpoint whenever
+    ``GENAI4SCIENCE_PERFORMANCE_API_KEY`` is set, and falls back to the shared
+    default endpoint otherwise. ``api_key_env`` is a variable *name*, not a
+    value -- the caller reads it from the environment when it builds its client.
+    """
+    if os.environ.get("GENAI4SCIENCE_PERFORMANCE_API_KEY"):
+        return (
+            os.environ.get("GENAI4SCIENCE_PERFORMANCE_BASE_URL",
+                           GENAI4SCIENCE_PERFORMANCE_BASE_URL),
+            "GENAI4SCIENCE_PERFORMANCE_API_KEY",
+        )
+    return (
+        os.environ.get("GENAI4SCIENCE_BASE_URL", GENAI4SCIENCE_BASE_URL),
+        "GENAI4SCIENCE_API_KEY",
+    )
+
+
+def resolve_endpoint(
+    provider: str | None, base_url: str | None, api_key_env: str | None
+) -> tuple[str | None, str]:
+    """``(base_url, api_key_env)`` for a generator, from ``--provider`` /
+    ``--base_url`` / ``--api_key_env``.
+
+    ``provider=None`` and ``base_url=None`` means plain OpenAI -- the SDK's own
+    default -- so a call with none of these three flags behaves exactly as it
+    did before this routing existed. An explicit ``base_url`` (paired with
+    ``api_key_env``) covers any OpenAI-compatible host directly; ``--provider
+    genai4science`` is the shorthand for the one this project actually uses.
+    """
+    if base_url or api_key_env:
+        if not (base_url and api_key_env):
+            raise SystemExit(
+                "--base_url and --api_key_env must be given together"
+            )
+        return base_url, api_key_env
+    if provider in (None, "openai"):
+        return None, "OPENAI_API_KEY"
+    if provider == "genai4science":
+        return genai4science_endpoint()
+    raise SystemExit(
+        f"unknown --provider {provider!r}; use 'openai', 'genai4science', or "
+        "give --base_url/--api_key_env directly"
+    )
+
+
 def summarize_value(value: str) -> str:
     """Return masked form: ****last4 or boolean string."""
     lower = value.lower()

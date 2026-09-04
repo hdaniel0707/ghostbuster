@@ -18,6 +18,7 @@ except ImportError:
     _anthropic = None
 
 from utils.prompt_utils import get_wp_prompts, get_reuter_prompts, get_essay_prompts
+from utils.env_utils import resolve_endpoint
 
 # uv run python fix_empty_generations.py --reuter_gpt_plain
 # uv run python fix_empty_generations.py --wp_gpt_plain 
@@ -93,20 +94,33 @@ def word_budget(path: Path, dataset):
 # API keys. ---
 
 _openai_client = None
+_openai_client_endpoint = None
 
 
-def _get_openai_client():
-    global _openai_client
-    if _openai_client is None:
+def _get_openai_client(base_url=None, api_key_env="OPENAI_API_KEY"):
+    """Lazily build (or rebuild, if the endpoint changed) the OpenAI client.
+
+    Lazy so a --debug or check-only run never needs an API key. Keyed on the
+    (base_url, api_key_env) pair rather than built once, because this script
+    checks one (dataset, type) per invocation but nothing stops --api_key_env
+    or --base_url differing between calls in a future caller.
+    """
+    global _openai_client, _openai_client_endpoint
+    endpoint = (base_url, api_key_env)
+    if _openai_client is None or _openai_client_endpoint != endpoint:
         import openai
 
-        _openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        api_key = os.environ.get(api_key_env)
+        if not api_key:
+            raise SystemExit(f"{api_key_env} is not set")
+        _openai_client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        _openai_client_endpoint = endpoint
     return _openai_client
 
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-def openai_backoff(**kwargs):
-    return _get_openai_client().chat.completions.create(**kwargs)
+def openai_backoff(base_url=None, api_key_env="OPENAI_API_KEY", **kwargs):
+    return _get_openai_client(base_url, api_key_env).chat.completions.create(**kwargs)
 
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
@@ -117,14 +131,15 @@ def claude_backoff(**kwargs):
     return client.messages.create(**kwargs)
 
 
-def call_llm(messages, mode, model, debug=False):
+def call_llm(messages, mode, model, debug=False, base_url=None, api_key_env="OPENAI_API_KEY"):
     if debug:
         return "[DEBUG]"
     # `or ""`: a model that answers with no content at all returns None here, and
     # a None that reaches .strip() crashes the file with an AttributeError
     # instead of being reported as the empty reply it is.
     if mode == "gpt":
-        response = openai_backoff(model=model, messages=messages)
+        response = openai_backoff(base_url=base_url, api_key_env=api_key_env,
+                                  model=model, messages=messages)
         return (response.choices[0].message.content or "").strip()
     elif mode == "claude":
         response = claude_backoff(model=model, max_tokens=2048, messages=messages)
@@ -193,7 +208,8 @@ def find_empty_files(root: Path):
 # generate.py. ---
 
 
-def regenerate_wp(path: Path, dataset, type_, mode, model, debug, words):
+def regenerate_wp(path: Path, dataset, type_, mode, model, debug, words,
+                  base_url=None, api_key_env="OPENAI_API_KEY"):
     idx = path.stem  # e.g. "15"
     prompt = Path(f"data/{dataset}/prompts/{idx}.txt").read_text().strip()
 
@@ -205,6 +221,8 @@ def regenerate_wp(path: Path, dataset, type_, mode, model, debug, words):
         mode=mode,
         model=model,
         debug=debug,
+        base_url=base_url,
+        api_key_env=api_key_env,
     )
     # (raw, cleaned): the raw reply is kept so a reply that survives the API and
     # is then deleted by post-processing can be told apart from one the model
@@ -212,7 +230,8 @@ def regenerate_wp(path: Path, dataset, type_, mode, model, debug, words):
     return reply, reply.replace("\n\n", "\n")
 
 
-def regenerate_essay(path: Path, type_, mode, model, debug, words, drop_preamble=False):
+def regenerate_essay(path: Path, type_, mode, model, debug, words, drop_preamble=False,
+                     base_url=None, api_key_env="OPENAI_API_KEY"):
     idx = path.stem
     prompt = Path(f"data/essay/prompts/{idx}.txt").read_text().strip()
 
@@ -224,13 +243,16 @@ def regenerate_essay(path: Path, type_, mode, model, debug, words, drop_preamble
         mode=mode,
         model=model,
         debug=debug,
+        base_url=base_url,
+        api_key_env=api_key_env,
     )
     if debug:
         return reply, reply
     return reply, strip_reuter_essay_boilerplate(reply, drop_preamble)
 
 
-def regenerate_reuter(path: Path, type_, mode, model, debug, words, drop_preamble=False):
+def regenerate_reuter(path: Path, type_, mode, model, debug, words, drop_preamble=False,
+                      base_url=None, api_key_env="OPENAI_API_KEY"):
     author, idx = path.parts[-2], path.stem
     # Headlines are always written under the `gpt` folder regardless of variant
     # (see generate.py's --reuter_prompts block), not under `type_`.
@@ -244,6 +266,8 @@ def regenerate_reuter(path: Path, type_, mode, model, debug, words, drop_preambl
         mode=mode,
         model=model,
         debug=debug,
+        base_url=base_url,
+        api_key_env=api_key_env,
     )
     if debug:
         return reply, reply
@@ -251,15 +275,18 @@ def regenerate_reuter(path: Path, type_, mode, model, debug, words, drop_preambl
 
 
 def regenerate_one(path: Path, dataset, type_, mode, model, debug, words,
-                   drop_preamble=False):
+                   drop_preamble=False, base_url=None, api_key_env="OPENAI_API_KEY"):
     """``(raw_reply, text_to_write)`` for one file."""
     if dataset == "wp":
         # wp never had the line-dropping, so drop_preamble does not reach it.
-        return regenerate_wp(path, dataset, type_, mode, model, debug, words)
+        return regenerate_wp(path, dataset, type_, mode, model, debug, words,
+                             base_url, api_key_env)
     elif dataset == "essay":
-        return regenerate_essay(path, type_, mode, model, debug, words, drop_preamble)
+        return regenerate_essay(path, type_, mode, model, debug, words, drop_preamble,
+                                base_url, api_key_env)
     elif dataset == "reuter":
-        return regenerate_reuter(path, type_, mode, model, debug, words, drop_preamble)
+        return regenerate_reuter(path, type_, mode, model, debug, words, drop_preamble,
+                                 base_url, api_key_env)
     else:
         raise ValueError(f"Unknown dataset {dataset!r}")
 
@@ -290,6 +317,17 @@ def build_parser():
                         help="OpenAI model to use when regenerating (must match the original run's model)")
     parser.add_argument("--claude_model", type=str, default="claude-sonnet-5",
                         help="Anthropic model to use when regenerating (must match the original run's model)")
+    parser.add_argument("--provider", type=str, default=None,
+                        choices=["openai", "genai4science"],
+                        help="Which OpenAI-compatible host serves --gpt_model. "
+                             "Must match the original generate.py run's "
+                             "--provider, or the refill comes from a different "
+                             "model. See generate.py --provider.")
+    parser.add_argument("--base_url", type=str, default=None,
+                        help="Same meaning as generate.py --base_url; must "
+                             "match the original run. Paired with --api_key_env.")
+    parser.add_argument("--api_key_env", type=str, default=None,
+                        help="Env var holding the API key for --base_url.")
     parser.add_argument("--debug", action="store_true",
                         help="Don't call any real API; write the literal string '[DEBUG]' instead")
     parser.add_argument("--yes", "-y", action="store_true",
@@ -404,6 +442,15 @@ def main():
     mode = "claude" if type_ == "claude" else "gpt"
     model = args.claude_model if mode == "claude" else args.gpt_model
 
+    base_url = api_key_env = None
+    if mode == "gpt" and not args.debug:
+        base_url, api_key_env = resolve_endpoint(args.provider, args.base_url, args.api_key_env)
+        if not os.environ.get(api_key_env):
+            parser.error(
+                f"{api_key_env} is not set -- required by --gpt_model {model!r} "
+                f"(--provider {args.provider!r}). Must match the original run."
+            )
+
     regenerated, skipped, failed, still_empty = [], [], [], []
 
     for f in retryable:
@@ -418,7 +465,7 @@ def main():
         try:
             raw, text = regenerate_one(
                 f, dataset, type_, mode, model, args.debug, budgets[f],
-                args.strip_boilerplate,
+                args.strip_boilerplate, base_url, api_key_env,
             )
         except Exception as e:
             print(f"  {RED}FAIL{RESET}  {f.relative_to(root)}: {e}")
