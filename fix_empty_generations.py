@@ -94,12 +94,14 @@ def word_budget(path: Path, dataset):
 # API keys. ---
 
 # Same hard ceiling on one reply as generate.py's MAX_OUTPUT_TOKENS, and for the
-# same reason: this script re-calls the model for every blank file, so a model
-# that will not stop itself (an open-weight model on a llama.cpp / Ollama
-# backend falling into a paragraph-level loop) would run to the context window
-# or a server timeout here just as it would in generate.py. A refill is capped
-# to the same length its neighbours were.
-MAX_OUTPUT_TOKENS = 4096
+# same reasons -- keep the two in step. This script re-calls the model for every
+# blank file, so a model that will not stop itself (an open-weight model on a
+# llama.cpp / Ollama backend falling into a paragraph-level loop) would run to
+# the context window or a server timeout here just as it would in generate.py.
+# And a reasoning model (gpt-oss:120b) needs the extra headroom: at 4096,
+# max_tokens bounds reasoning + answer together, so the analysis channel could
+# eat the whole budget and this script would "refill" a blank with another blank.
+MAX_OUTPUT_TOKENS = 16384
 
 _openai_client = None
 _openai_client_endpoint = None

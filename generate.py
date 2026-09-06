@@ -160,13 +160,21 @@ def html_replace(text):
 _openai_client = None
 
 # Hard ceiling on one reply. Every prompt asks for an essay / story / article of
-# a stated word count (<= ~1000 words, so <= ~1500 tokens); 4096 never clips a
-# real one. It is a stop for a model that will not stop itself: an open-weight
-# model on a llama.cpp / Ollama backend with no repetition penalty can fall into
-# a paragraph-level loop -- re-writing its own conclusion dozens of times -- and
-# run to the context window or a server timeout. Same reason the claude path
-# below already caps at 2048.
-MAX_OUTPUT_TOKENS = 4096
+# a stated word count (<= ~1000 words, so <= ~1500 tokens of prose). It is a stop
+# for a model that will not stop itself: an open-weight model on a llama.cpp /
+# Ollama backend with no repetition penalty can fall into a paragraph-level loop
+# -- re-writing its own conclusion dozens of times -- and run to the context
+# window or a server timeout. Same reason the claude path below already caps at
+# 2048.
+#
+# 16384, not ~4096: on an OpenAI-compatible backend that serves a REASONING model
+# (gpt-oss:120b via GenAI4Science), max_tokens bounds reasoning + answer TOGETHER.
+# The analysis channel alone can run several thousand tokens on a short article,
+# so a 4096 cap truncated mid-reasoning -- finish_reason "length", empty content,
+# recorded here as "empty reply". 16384 leaves the reasoning room; a runaway loop
+# still hits a ceiling (and scrub_bad_generations.py deletes anything >= 4x its
+# human original independently).
+MAX_OUTPUT_TOKENS = 16384
 
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
