@@ -159,6 +159,15 @@ def html_replace(text):
 # client, built once, before any worker thread can read it.
 _openai_client = None
 
+# Hard ceiling on one reply. Every prompt asks for an essay / story / article of
+# a stated word count (<= ~1000 words, so <= ~1500 tokens); 4096 never clips a
+# real one. It is a stop for a model that will not stop itself: an open-weight
+# model on a llama.cpp / Ollama backend with no repetition penalty can fall into
+# a paragraph-level loop -- re-writing its own conclusion dozens of times -- and
+# run to the context window or a server timeout. Same reason the claude path
+# below already caps at 2048.
+MAX_OUTPUT_TOKENS = 4096
+
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
 def openai_backoff(**kwargs):
@@ -183,7 +192,9 @@ def call_llm(messages, mode, model, debug=False):
     # failed call with no file written, hiding an empty REPLY behind what looks
     # like a transport error. An empty string is what actually happened.
     if mode == "gpt":
-        response = openai_backoff(model=model, messages=messages)
+        response = openai_backoff(
+            model=model, messages=messages, max_tokens=MAX_OUTPUT_TOKENS
+        )
         return (response.choices[0].message.content or "").strip()
     elif mode == "claude":
         response = claude_backoff(
