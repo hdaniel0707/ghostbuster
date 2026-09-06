@@ -93,6 +93,14 @@ def word_budget(path: Path, dataset):
 # but with lazily-created clients so a --debug or check-only run never needs
 # API keys. ---
 
+# Same hard ceiling on one reply as generate.py's MAX_OUTPUT_TOKENS, and for the
+# same reason: this script re-calls the model for every blank file, so a model
+# that will not stop itself (an open-weight model on a llama.cpp / Ollama
+# backend falling into a paragraph-level loop) would run to the context window
+# or a server timeout here just as it would in generate.py. A refill is capped
+# to the same length its neighbours were.
+MAX_OUTPUT_TOKENS = 4096
+
 _openai_client = None
 _openai_client_endpoint = None
 
@@ -139,7 +147,8 @@ def call_llm(messages, mode, model, debug=False, base_url=None, api_key_env="OPE
     # instead of being reported as the empty reply it is.
     if mode == "gpt":
         response = openai_backoff(base_url=base_url, api_key_env=api_key_env,
-                                  model=model, messages=messages)
+                                  model=model, messages=messages,
+                                  max_tokens=MAX_OUTPUT_TOKENS)
         return (response.choices[0].message.content or "").strip()
     elif mode == "claude":
         response = claude_backoff(model=model, max_tokens=2048, messages=messages)
