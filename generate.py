@@ -412,7 +412,12 @@ REUTER_ARTICLES_PER_AUTHOR = 20
 
 
 # The word budget asked of the model is the human partner's length, rounded to
-# this step and never allowed below it. Both numbers are 50 deliberately:
+# this step and never allowed below it. The length is counted with str.split()
+# (any whitespace run is one separator), NOT str.split(" ") -- some human essays
+# embed whitespace-padded statistical tables, where split(" ") counts every one
+# of hundreds of consecutive spaces as a word and inflates the budget ~10x, so
+# the prompt asks for a 7000-word essay and the model dutifully writes a runaway.
+# Both numbers are 50 deliberately:
 #
 #   THE STEP was 100, which is coarse enough to matter at the short end -- a
 #   450-word article and a 549-word one were both asked for 500. 50 tracks the
@@ -707,7 +712,7 @@ if __name__ == "__main__":
                 prompt = f.read().strip()
 
             with open(f"data/wp/human/{idx}.txt", "r") as f:
-                words = round_to_50(len(f.read().split(" ")))
+                words = round_to_50(len(f.read().split()))
 
             for types, mode, model in wp_variants:
                 prompts = get_wp_prompts(words, prompt)
@@ -802,7 +807,7 @@ if __name__ == "__main__":
                 make_call(
                     "Given the following news article, write a headline for it. "
                     "Respond with just the plain headline text, no markdown "
-                    f"formatting or asterisks:\n\n{' '.join(doc.split(' ')[:500])}",
+                    f"formatting or asterisks:\n\n{' '.join(doc.split()[:500])}",
                     "gpt", args.gpt_model, args.debug,
                     post=clean_headline,
                 ),
@@ -832,7 +837,7 @@ if __name__ == "__main__":
         tasks = []
         for author, idx in author_idx_pairs:
             with open(f"data/reuter/human/{author}/{idx}.txt", "r") as f:
-                words = round_to_50(len(f.read().split(" ")))
+                words = round_to_50(len(f.read().split()))
 
             with open(f"data/reuter/gpt/{author}/headlines/{idx}.txt", "r") as f:
                 headline = f.read().strip()
@@ -922,7 +927,7 @@ if __name__ == "__main__":
                 f"data/essay/prompts/{idx}.txt",
                 make_call(
                     "Given the following essay, write a prompt for it:\n\n"
-                    f"{' '.join(doc.split(' ')[:500])}",
+                    f"{' '.join(doc.split()[:500])}",
                     "gpt", args.gpt_model, args.debug,
                     post=lambda reply: reply.replace("Prompt: ", "").strip(),
                 ),
@@ -950,7 +955,7 @@ if __name__ == "__main__":
                 prompt = f.read().strip()
 
             with open(f"data/essay/human/{idx}.txt", "r") as f:
-                words = round_to_50(len(f.read().split(" ")))
+                words = round_to_50(len(f.read().split()))
 
             for types, mode, model in essay_variants:
                 prompts = get_essay_prompts(words, prompt)

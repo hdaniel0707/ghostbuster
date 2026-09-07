@@ -87,7 +87,10 @@ def word_budget(path: Path, dataset):
         human = Path(f"data/{dataset}/human/{path.stem}.txt")
     if not human.is_file():
         return None
-    return round_to_50(len(human.read_text().split(" ")))
+    # str.split(), not split(" "): a human essay with a whitespace-padded table
+    # would otherwise count each padding space as a word (see generate.py's
+    # WORD_BUDGET comment) and this refill would ask for a runaway.
+    return round_to_50(len(human.read_text().split()))
 
 # --- LLM calling, mirroring generate.py's call_llm/openai_backoff/claude_backoff,
 # but with lazily-created clients so a --debug or check-only run never needs
