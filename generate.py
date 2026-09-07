@@ -176,6 +176,14 @@ _openai_client = None
 # human original independently).
 MAX_OUTPUT_TOKENS = 16384
 
+# Which parameter carries MAX_OUTPUT_TOKENS on a "gpt"-mode call. OpenAI's own
+# API (base_url None) dropped `max_tokens` for the GPT-5 family and 400s on it
+# with 'unsupported_parameter' -- it wants `max_completion_tokens`. Every
+# OpenAI-*compatible* backend this project uses (GenAI4Science's vLLM) still
+# takes the legacy `max_tokens`. Set once in __main__, from the resolved
+# endpoint -- not a try/except, so a real 400 is never silently absorbed.
+_gpt_token_param = "max_tokens"
+
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
 def openai_backoff(**kwargs):
@@ -201,7 +209,8 @@ def call_llm(messages, mode, model, debug=False):
     # like a transport error. An empty string is what actually happened.
     if mode == "gpt":
         response = openai_backoff(
-            model=model, messages=messages, max_tokens=MAX_OUTPUT_TOKENS
+            model=model, messages=messages,
+            **{_gpt_token_param: MAX_OUTPUT_TOKENS},
         )
         return (response.choices[0].message.content or "").strip()
     elif mode == "claude":
@@ -569,6 +578,11 @@ if __name__ == "__main__":
                 f"{args.gpt_model!r} (--provider {args.provider!r})"
             )
         _openai_client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        # base_url None == OpenAI's own API == needs max_completion_tokens; any
+        # explicit endpoint (GenAI4Science) takes the legacy max_tokens.
+        _gpt_token_param = (
+            "max_completion_tokens" if base_url is None else "max_tokens"
+        )
 
     # --out_name names ONE directory, so it cannot describe two prompts. Two
     # types selected alongside it would either share a directory (and the

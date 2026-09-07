@@ -148,9 +148,14 @@ def call_llm(messages, mode, model, debug=False, base_url=None, api_key_env="OPE
     # a None that reaches .strip() crashes the file with an AttributeError
     # instead of being reported as the empty reply it is.
     if mode == "gpt":
+        # OpenAI's own API (base_url None) rejects the legacy `max_tokens` for
+        # the GPT-5 family and wants `max_completion_tokens`; GenAI4Science's
+        # OpenAI-compatible backend still takes `max_tokens`. Same rule as
+        # generate.py's _gpt_token_param, decided per call from the endpoint.
+        token_param = "max_completion_tokens" if base_url is None else "max_tokens"
         response = openai_backoff(base_url=base_url, api_key_env=api_key_env,
                                   model=model, messages=messages,
-                                  max_tokens=MAX_OUTPUT_TOKENS)
+                                  **{token_param: MAX_OUTPUT_TOKENS})
         return (response.choices[0].message.content or "").strip()
     elif mode == "claude":
         response = claude_backoff(model=model, max_tokens=2048, messages=messages)
