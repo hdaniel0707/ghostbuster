@@ -5,33 +5,20 @@ from dotenv import dotenv_values
 
 # --- OpenAI-compatible endpoint routing, for generate.py / fix_empty_generations.py ---
 #
-# Mirrors epai/utils/env_utils.py::genai4science_endpoint() in the main repo.
-# Duplicated rather than imported: this fork runs in its own uv environment and
-# cannot import across that boundary (see the main repo's
-# epai/ghostbuster/run_full_pipeline.py). Keep the two in step if the endpoint
-# changes.
-GENAI4SCIENCE_BASE_URL = "https://genai.science-cloud.hu/api"
-GENAI4SCIENCE_PERFORMANCE_BASE_URL = "https://genai.science-cloud.hu/performance-api/"
+# ``--provider openweight`` routes --gpt_model to an OpenAI-compatible endpoint
+# serving open-weight models (e.g. a vLLM server): its base URL and key come from
+# OPENWEIGHT_BASE_URL and OPENWEIGHT_API_KEY.
 
 
-def genai4science_endpoint() -> tuple[str, str]:
-    """``(base_url, api_key_env)`` for the GenAI4Science endpoint.
-
-    Prefers the **performance** endpoint whenever
-    ``GENAI4SCIENCE_PERFORMANCE_API_KEY`` is set, and falls back to the shared
-    default endpoint otherwise. ``api_key_env`` is a variable *name*, not a
-    value -- the caller reads it from the environment when it builds its client.
-    """
-    if os.environ.get("GENAI4SCIENCE_PERFORMANCE_API_KEY"):
-        return (
-            os.environ.get("GENAI4SCIENCE_PERFORMANCE_BASE_URL",
-                           GENAI4SCIENCE_PERFORMANCE_BASE_URL),
-            "GENAI4SCIENCE_PERFORMANCE_API_KEY",
-        )
-    return (
-        os.environ.get("GENAI4SCIENCE_BASE_URL", GENAI4SCIENCE_BASE_URL),
-        "GENAI4SCIENCE_API_KEY",
-    )
+def openweight_endpoint() -> tuple[str, str]:
+    """``(base_url, api_key_env)`` for the open-weight endpoint.
+    ``api_key_env`` is a variable *name*, not a value -- the caller reads it
+    from the environment when it builds its client."""
+    base_url = os.environ.get("OPENWEIGHT_BASE_URL")
+    if not base_url:
+        raise SystemExit("--provider openweight needs OPENWEIGHT_BASE_URL "
+                         "(an OpenAI-compatible endpoint) in the environment or .env")
+    return base_url, "OPENWEIGHT_API_KEY"
 
 
 def resolve_endpoint(
@@ -44,7 +31,7 @@ def resolve_endpoint(
     default -- so a call with none of these three flags behaves exactly as it
     did before this routing existed. An explicit ``base_url`` (paired with
     ``api_key_env``) covers any OpenAI-compatible host directly; ``--provider
-    genai4science`` is the shorthand for the one this project actually uses.
+    openweight`` reads the endpoint from OPENWEIGHT_BASE_URL / OPENWEIGHT_API_KEY.
     """
     if base_url or api_key_env:
         if not (base_url and api_key_env):
@@ -54,10 +41,10 @@ def resolve_endpoint(
         return base_url, api_key_env
     if provider in (None, "openai"):
         return None, "OPENAI_API_KEY"
-    if provider == "genai4science":
-        return genai4science_endpoint()
+    if provider == "openweight":
+        return openweight_endpoint()
     raise SystemExit(
-        f"unknown --provider {provider!r}; use 'openai', 'genai4science', or "
+        f"unknown --provider {provider!r}; use 'openai', 'openweight', or "
         "give --base_url/--api_key_env directly"
     )
 

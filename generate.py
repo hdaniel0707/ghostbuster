@@ -168,7 +168,7 @@ _openai_client = None
 # 2048.
 #
 # 16384, not ~4096: on an OpenAI-compatible backend that serves a REASONING model
-# (gpt-oss:120b via GenAI4Science), max_tokens bounds reasoning + answer TOGETHER.
+# (gpt-oss:120b via --provider openweight), max_tokens bounds reasoning + answer TOGETHER.
 # The analysis channel alone can run several thousand tokens on a short article,
 # so a 4096 cap truncated mid-reasoning -- finish_reason "length", empty content,
 # recorded here as "empty reply". 16384 leaves the reasoning room; a runaway loop
@@ -179,7 +179,7 @@ MAX_OUTPUT_TOKENS = 16384
 # Which parameter carries MAX_OUTPUT_TOKENS on a "gpt"-mode call. OpenAI's own
 # API (base_url None) dropped `max_tokens` for the GPT-5 family and 400s on it
 # with 'unsupported_parameter' -- it wants `max_completion_tokens`. Every
-# OpenAI-*compatible* backend this project uses (GenAI4Science's vLLM) still
+# OpenAI-*compatible* backend this project uses (a vLLM server) still
 # takes the legacy `max_tokens`. Set once in __main__, from the resolved
 # endpoint -- not a try/except, so a real 400 is never silently absorbed.
 _gpt_token_param = "max_tokens"
@@ -479,14 +479,13 @@ if __name__ == "__main__":
     parser.add_argument("--claude_model", type=str, default="claude-sonnet-5",
                         help="Anthropic Claude model to use instead of OpenAI")
     parser.add_argument("--provider", type=str, default=None,
-                        choices=["openai", "genai4science"],
+                        choices=["openai", "openweight"],
                         help="Which OpenAI-compatible host serves --gpt_model. "
                              "Omitted or 'openai' calls OpenAI itself with "
-                             "OPENAI_API_KEY, unchanged from before this flag "
-                             "existed. 'genai4science' calls HUN-REN SZTAKI's "
-                             "endpoint (GENAI4SCIENCE_API_KEY, or "
-                             "GENAI4SCIENCE_PERFORMANCE_API_KEY when set, which "
-                             "wins). Ignored for --*_claude.")
+                             "OPENAI_API_KEY. 'openweight' calls the "
+                             "OpenAI-compatible endpoint at OPENWEIGHT_BASE_URL "
+                             "with OPENWEIGHT_API_KEY (open-weight models). "
+                             "Ignored for --*_claude.")
     parser.add_argument("--base_url", type=str, default=None,
                         help="Call this OpenAI-compatible base URL instead of "
                              "OpenAI's own, for a host --provider has no "
@@ -584,7 +583,7 @@ if __name__ == "__main__":
             )
         _openai_client = openai.OpenAI(api_key=api_key, base_url=base_url)
         # base_url None == OpenAI's own API == needs max_completion_tokens; any
-        # explicit endpoint (GenAI4Science) takes the legacy max_tokens.
+        # explicit endpoint (--provider openweight) takes the legacy max_tokens.
         _gpt_token_param = (
             "max_completion_tokens" if base_url is None else "max_tokens"
         )

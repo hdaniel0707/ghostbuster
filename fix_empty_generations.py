@@ -152,8 +152,8 @@ def call_llm(messages, mode, model, debug=False, base_url=None, api_key_env="OPE
     # instead of being reported as the empty reply it is.
     if mode == "gpt":
         # OpenAI's own API (base_url None) rejects the legacy `max_tokens` for
-        # the GPT-5 family and wants `max_completion_tokens`; GenAI4Science's
-        # OpenAI-compatible backend still takes `max_tokens`. Same rule as
+        # the GPT-5 family and wants `max_completion_tokens`; an
+        # OpenAI-compatible backend (--provider openweight) still takes `max_tokens`. Same rule as
         # generate.py's _gpt_token_param, decided per call from the endpoint.
         token_param = "max_completion_tokens" if base_url is None else "max_tokens"
         response = openai_backoff(base_url=base_url, api_key_env=api_key_env,
@@ -337,7 +337,7 @@ def build_parser():
     parser.add_argument("--claude_model", type=str, default="claude-sonnet-5",
                         help="Anthropic model to use when regenerating (must match the original run's model)")
     parser.add_argument("--provider", type=str, default=None,
-                        choices=["openai", "genai4science"],
+                        choices=["openai", "openweight"],
                         help="Which OpenAI-compatible host serves --gpt_model. "
                              "Must match the original generate.py run's "
                              "--provider, or the refill comes from a different "
